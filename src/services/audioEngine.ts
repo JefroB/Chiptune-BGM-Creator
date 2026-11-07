@@ -552,23 +552,38 @@ export class AudioEngine {
 
       if (route && !route.muted) {
         const voiceId = route.voiceId;
+        const target = midiDeviceManager.resolveVoiceTarget(voiceId);
 
         if (ev.type === 'noteOn' && ev.note !== undefined && ev.velocity && ev.velocity > 0) {
           setTimeout(() => {
             if (this.isRunning && !this.isPaused) {
               this.triggerNoteOn(voiceId, ev.note!, ev.velocity!);
+              midiDeviceManager.sendNoteOn(target.portId, target.channel, ev.note!, ev.velocity!);
             }
           }, delayMs);
         } else if ((ev.type === 'noteOff' || (ev.type === 'noteOn' && (!ev.velocity || ev.velocity === 0))) && ev.note !== undefined) {
           setTimeout(() => {
             if (this.isRunning && !this.isPaused) {
               this.triggerNoteOff(voiceId, ev.note!);
+              midiDeviceManager.sendNoteOff(target.portId, target.channel, ev.note!);
             }
           }, delayMs);
         } else if (ev.type === 'cc' && ev.controller !== undefined && ev.value !== undefined) {
           setTimeout(() => {
             if (this.isRunning && !this.isPaused) {
-              midiDeviceManager.sendMidinesCC(ev.channel + 1, ev.controller!, ev.value!, 'SMF Controller');
+              midiDeviceManager.sendCC(target.portId, target.channel, ev.controller!, ev.value!, `${target.hardware} Controller`);
+            }
+          }, delayMs);
+        } else if (ev.type === 'pitchBend' && ev.value !== undefined) {
+          setTimeout(() => {
+            if (this.isRunning && !this.isPaused) {
+              midiDeviceManager.sendPitchBend(target.portId, target.channel, ev.value!);
+            }
+          }, delayMs);
+        } else if (ev.type === 'programChange' && ev.value !== undefined) {
+          setTimeout(() => {
+            if (this.isRunning && !this.isPaused) {
+              midiDeviceManager.sendProgramChange(target.portId, target.channel, ev.value!);
             }
           }, delayMs);
         }

@@ -189,20 +189,96 @@ class MidiDeviceManager {
   }
 
   /**
-   * Transmit MIDInes Controller parameter update
+   * Safe Voice Target Resolver
+   * Resolves physical port and MIDI channel for any voice without cross-talk.
+   * Strictly isolates MIDInes from SID cores.
    */
-  public sendMidinesCC(channel: number, controller: number, value: number, desc: string) {
-    const ch = Math.max(0, Math.min(15, channel - 1));
-    const bytes = [0xb0 | ch, controller & 0x7f, value & 0x7f];
-    this.sendRaw(this.binding.midinesPortId, bytes, 'CC', channel, `MIDInes Ch ${channel} CC${controller}=${value} (${desc})`);
+  public resolveVoiceTarget(voiceId: string): { portId: string | null; channel: number; hardware: 'MIDInes' | 'MIDIbox SID' } {
+    if (voiceId.startsWith('nes.')) {
+      let ch = 1;
+      if (voiceId === 'nes.pulse1') ch = 1;
+      else if (voiceId === 'nes.pulse2') ch = 2;
+      else if (voiceId === 'nes.triangle') ch = 3;
+      else if (voiceId === 'nes.noise') ch = 4;
+      else if (voiceId === 'nes.dpcm') ch = 5;
+      return { portId: this.binding.midinesPortId, channel: ch, hardware: 'MIDInes' };
+    }
+
+    // SID Cores 1 to 4
+    let coreIdx = 0;
+    if (voiceId === 'sid.core1') coreIdx = 0;
+    else if (voiceId === 'sid.core2') coreIdx = 1;
+    else if (voiceId === 'sid.core3') coreIdx = 2;
+    else if (voiceId === 'sid.core4') coreIdx = 3;
+
+    const channel = this.binding.sidCoreChannels[coreIdx] || (coreIdx + 6);
+    // Never fall back to MIDInes port! If unassigned, portId is null (simulator/offline)
+    const portId = this.binding.sidCorePorts[coreIdx] || null;
+    return { portId, channel, hardware: 'MIDIbox SID' };
   }
 
   /**
-   * Transmit MIDIbox SID NRPN parameter update
+   * Transmit Note On to hardware port
+   */
+  public sendNoteOn(portId: string | null, channel: number, note: number, velocity: number) {
+    const ch = Math.max(0, Math.min(15, channel - 1));
+    const bytes = [0x90 | ch, note & 0x7f, Math.max(0, Math.min(127, Math.round(velocity)))];
+    this.sendRaw(portId, bytes, 'NOTE', channel, `Note On ${note} (vel ${velocity})`);
+  }
+
+  /**
+   * Transmit Note Off to hardware port
+   */
+  public sendNoteOff(portId: string | null, channel: number, note: number) {
+    const ch = Math.max(0, Math.min(15, channel - 1));
+    const bytes = [0x80 | ch, note & 0x7f, 0];
+    this.sendRaw(portId, bytes, 'NOTE', channel, `Note Off ${note}`);
+  }
+
+  /**
+   * Transmit Control Change to hardware port
+   */
+  public sendCC(portId: string | null, channel: number, controller: number, value: number, desc = 'CC') {
+    const ch = Math.max(0, Math.min(15, channel - 1));
+    const bytes = [0xb0 | ch, controller & 0x7f, value & 0x7f];
+    this.sendRaw(portId, bytes, 'CC', channel, `Ch ${channel} CC${controller}=${value} (${desc})`);
+  }
+
+  /**
+   * Transmit Pitch Bend to hardware port
+   */
+  public sendPitchBend(portId: string | null, channel: number, bend: number) {
+    const ch = Math.max(0, Math.min(15, channel - 1));
+    const clampedBend = Math.max(0, Math.min(16383, Math.round(bend)));
+    const lsb = clampedBend & 0x7f;
+    const msb = (clampedBend >> 7) & 0x7f;
+    const bytes = [0xe0 | ch, lsb, msb];
+    this.sendRaw(portId, bytes, 'CC', channel, `Ch ${channel} Pitch Bend ${bend}`);
+  }
+
+  /**
+   * Transmit Program Change to hardware port
+   */
+  public sendProgramChange(portId: string | null, channel: number, program: number) {
+    const ch = Math.max(0, Math.min(15, channel - 1));
+    const bytes = [0xc0 | ch, program & 0x7f];
+    this.sendRaw(portId, bytes, 'CC', channel, `Ch ${channel} Program Change ${program}`);
+  }
+
+  /**
+   * Transmit MIDInes Controller parameter update
+   */
+  public sendMidinesCC(channel: number, controller: number, value: number, desc: string) {
+    this.sendCC(this.binding.midinesPortId, channel, controller, value, `MIDInes ${desc}`);
+  }
+
+  /**
+   * Transmit MIDIbox SID NRPN parameter update (strictly uses SID port, NEVER MIDInes)
    */
   public sendSidNrpn(coreIndex: number, nrpnAddress: number, value: number, desc: string) {
     const channel = this.binding.sidCoreChannels[coreIndex] || (coreIndex + 6);
-    const portId = this.binding.sidCorePorts[coreIndex] || this.binding.midinesPortId;
+    // Explicitly isolated: NEVER fall back to MIDInes port
+    const portId = this.binding.sidCorePorts[coreIndex] || null;
     const nrpn = encodeNrpn(channel - 1, nrpnAddress, value);
     this.sendRaw(portId, nrpn.rawBytes, 'NRPN', channel, `SID Core ${coreIndex + 1} Ch ${channel} NRPN 0x${nrpnAddress.toString(16).toUpperCase()}=${value} (${desc})`);
   }
@@ -211,8 +287,7 @@ class MidiDeviceManager {
    * Transmit SysEx patch dump or command
    */
   public sendSysEx(portId: string | null, sysexBytes: Uint8Array | number[], desc: string) {
-    const targetPort = portId || this.binding.midinesPortId;
-    this.sendRaw(targetPort, sysexBytes, 'SYSEX', 0, `SysEx: ${desc} (${sysexBytes.length} bytes)`);
+    this.sendRaw(portId, sysexBytes, 'SYSEX', 0, `SysEx: ${desc} (${sysexBytes.length} bytes)`);
   }
 
   /**

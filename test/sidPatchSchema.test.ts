@@ -96,7 +96,7 @@ test('Multi Engine: preserves multi-instrument count and configuration', () => {
   assert.equal(restored.engine, 'multi');
   if (restored.engine === 'multi') {
     assert.equal(restored.instruments.length, original.instruments.length);
-    assert.equal(restored.instruments[0].name, 'Multi Inst 1');
+    assert.equal(restored.instruments[0].name, original.instruments[0].name);
   }
 });
 

@@ -23,8 +23,62 @@ const isProduction = process.env.NODE_ENV === 'production';
 app.use(express.json({ limit: '50mb' }));
 
 /**
+ * Cross-platform FFmpeg / FFprobe executable locator
+ * Supports Windows PATH / Program Files / AppData and Linux / Unix paths
+ */
+async function resolveBinary(name: 'ffmpeg' | 'ffprobe'): Promise<string> {
+  const envVar = name === 'ffmpeg' ? process.env.FFMPEG_PATH : process.env.FFPROBE_PATH;
+  if (envVar && fs.existsSync(envVar)) {
+    return envVar;
+  }
+
+  const isWin = process.platform === 'win32';
+  const binaryName = isWin ? `${name}.exe` : name;
+
+  if (isWin) {
+    const winCandidates = [
+      `C:\\ffmpeg\\bin\\${binaryName}`,
+      `C:\\Program Files\\ffmpeg\\bin\\${binaryName}`,
+      `C:\\Program Files (x86)\\ffmpeg\\bin\\${binaryName}`,
+      path.join(process.cwd(), 'bin', binaryName),
+      path.join(os.homedir(), 'AppData', 'Local', 'Microsoft', 'WinGet', 'Packages', binaryName),
+      binaryName
+    ];
+    for (const cand of winCandidates) {
+      if (fs.existsSync(cand)) return cand;
+    }
+    try {
+      const { stdout } = await execFileAsync('where.exe', [binaryName]);
+      const first = stdout.trim().split(/\r?\n/)[0];
+      if (first && fs.existsSync(first)) return first;
+    } catch {}
+    return binaryName;
+  }
+
+  const unixCandidates = [
+    `/usr/bin/${name}`,
+    `/usr/local/bin/${name}`,
+    `/opt/homebrew/bin/${name}`,
+    name
+  ];
+  for (const cand of unixCandidates) {
+    if (fs.existsSync(cand)) return cand;
+  }
+
+  try {
+    const { stdout } = await execFileAsync('which', [name]);
+    const first = stdout.trim().split('\n')[0];
+    if (first && fs.existsSync(first)) return first;
+  } catch {}
+
+  return name;
+}
+
+/**
  * POST /api/export-vorbis
- * Encodes audio using genuine libvorbis via FFmpeg with exact RPG Maker MV LOOPSTART & LOOPLENGTH tags
+ * Encodes audio using genuine libvorbis with cross-platform FFmpeg resolution,
+ * sets exact RPG Maker MV LOOPSTART & LOOPLENGTH tags, and independently verifies
+ * by decoding back to raw PCM and probing metadata.
  */
 app.post('/api/export-vorbis', async (req: Request, res: Response): Promise<void> => {
   const { wavBase64, loopStart, loopLength, sampleRate, title, artist, fileName } = req.body;
@@ -42,13 +96,18 @@ app.post('/api/export-vorbis', async (req: Request, res: Response): Promise<void
   const id = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
   const tmpWavPath = path.join(tmpDir, `input_${id}.wav`);
   const tmpOggPath = path.join(tmpDir, `output_${id}.ogg`);
+  const tmpDecodedPcmPath = path.join(tmpDir, `verify_${id}.raw`);
 
   try {
     // Write WAV buffer to temp file
     const wavBuffer = Buffer.from(wavBase64, 'base64');
     await fs.promises.writeFile(tmpWavPath, wavBuffer);
 
-    // Run /usr/bin/ffmpeg with libvorbis
+    // Resolve FFmpeg & FFprobe cross-platform binaries
+    const ffmpegBin = await resolveBinary('ffmpeg');
+    const ffprobeBin = await resolveBinary('ffprobe');
+
+    // Run FFmpeg with libvorbis
     // Sets exact uppercase LOOPSTART and LOOPLENGTH tags required by RPG Maker MV and MZ
     const ffmpegArgs = [
       '-y',
@@ -62,9 +121,9 @@ app.post('/api/export-vorbis', async (req: Request, res: Response): Promise<void
       tmpOggPath
     ];
 
-    await execFileAsync('/usr/bin/ffmpeg', ffmpegArgs);
+    await execFileAsync(ffmpegBin, ffmpegArgs);
 
-    // Verify using ffprobe to confirm vorbis codec and comments
+    // 1. Independent validation: verify with ffprobe
     const ffprobeArgs = [
       '-v', 'quiet',
       '-print_format', 'json',
@@ -72,14 +131,33 @@ app.post('/api/export-vorbis', async (req: Request, res: Response): Promise<void
       '-show_streams',
       tmpOggPath
     ];
-    const { stdout: probeStdout } = await execFileAsync('/usr/bin/ffprobe', ffprobeArgs);
+    const { stdout: probeStdout } = await execFileAsync(ffprobeBin, ffprobeArgs);
     const probeData = JSON.parse(probeStdout);
 
-    const tags = probeData.format?.tags || {};
     const stream = probeData.streams?.[0] || {};
+    const tags = { ...(probeData.format?.tags || {}), ...(stream.tags || {}) };
 
     if (stream.codec_name !== 'vorbis') {
-      throw new Error(`FFmpeg output codec is ${stream.codec_name}, expected vorbis`);
+      throw new Error(`Independent verification failed: Output codec is ${stream.codec_name}, expected vorbis`);
+    }
+
+    const startTag = tags.LOOPSTART || tags.loopstart;
+    const lenTag = tags.LOOPLENGTH || tags.looplength;
+    if (!startTag || !lenTag) {
+      throw new Error('Independent verification failed: Missing required LOOPSTART or LOOPLENGTH Vorbis comment');
+    }
+
+    // 2. Independent validation: decode back to raw float32 PCM using ffmpeg to verify decodability
+    await execFileAsync(ffmpegBin, [
+      '-y',
+      '-i', tmpOggPath,
+      '-f', 'f32le',
+      '-acodec', 'pcm_f32le',
+      tmpDecodedPcmPath
+    ]);
+    const decodedStats = await fs.promises.stat(tmpDecodedPcmPath);
+    if (decodedStats.size === 0) {
+      throw new Error('Independent verification failed: Decoded Vorbis stream yielded 0 bytes');
     }
 
     // Read generated genuine Ogg Vorbis binary
@@ -90,6 +168,7 @@ app.post('/api/export-vorbis', async (req: Request, res: Response): Promise<void
     res.setHeader('X-Loop-Start', String(loopStartInt));
     res.setHeader('X-Loop-Length', String(loopLengthInt));
     res.setHeader('X-Vorbis-Verified', 'true');
+    res.setHeader('X-Decoded-Bytes', String(decodedStats.size));
     res.send(oggBuffer);
   } catch (err: any) {
     console.error('Error during Vorbis export:', err);
@@ -101,6 +180,7 @@ app.post('/api/export-vorbis', async (req: Request, res: Response): Promise<void
     // Cleanup temporary files
     try { await fs.promises.unlink(tmpWavPath); } catch {}
     try { await fs.promises.unlink(tmpOggPath); } catch {}
+    try { await fs.promises.unlink(tmpDecodedPcmPath); } catch {}
   }
 });
 
@@ -122,7 +202,8 @@ app.post('/api/probe-audio', async (req: Request, res: Response): Promise<void> 
 
   try {
     await fs.promises.writeFile(tmpPath, Buffer.from(audioBase64, 'base64'));
-    const { stdout } = await execFileAsync('/usr/bin/ffprobe', [
+    const ffprobeBin = await resolveBinary('ffprobe');
+    const { stdout } = await execFileAsync(ffprobeBin, [
       '-v', 'quiet',
       '-print_format', 'json',
       '-show_format',
