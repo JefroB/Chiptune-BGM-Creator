@@ -52,24 +52,23 @@ export const PatchbayView: React.FC<PatchbayViewProps> = ({
 
   const runLatencyCalibration = () => {
     setIsCalibrating(true);
-    setCalibrationLog('Emitting 1kHz safe test impulse on Master Send (Out 1/2)...');
+    setCalibrationLog('Checking native ASIO loopback detector on Master Send (Out 1/2) -> Mastering Return (In 14/15)...');
 
     setTimeout(() => {
-      setCalibrationLog('Measuring physical return arrival on Mastering Return (In 14/15)...');
-      setTimeout(() => {
-        const measuredMasterMs = 4.2;
-        const measuredFxMs = 6.8;
-        onUpdateCalibration({
-          midiOffsetMs: 1.5,
-          fxLoopRoundtripMs: measuredFxMs,
-          masterRoundtripMs: measuredMasterMs
-        });
-        setCalibrationLog(
-          `Calibration complete: Master Roundtrip = ${measuredMasterMs}ms (201 samples @ 48kHz), FX Loop = ${measuredFxMs}ms.`
-        );
-        setIsCalibrating(false);
-      }, 700);
-    }, 600);
+      // In simulator / browser mode without a physical audio cable connecting Out 1/2 to In 14/15:
+      const bufferSamples = 128;
+      const sampleRate = 48000;
+      const theoreticalBufferMs = Math.round((bufferSamples / sampleRate) * 1000 * 10) / 10;
+      onUpdateCalibration({
+        midiOffsetMs: 1.5,
+        fxLoopRoundtripMs: 5.3,
+        masterRoundtripMs: theoreticalBufferMs
+      });
+      setCalibrationLog(
+        `Simulation Latency: ASIO buffer delay calculated at ${theoreticalBufferMs}ms (${bufferSamples} spl @ ${sampleRate / 1000}kHz). Physical roundtrip measurement requires native loopback cable.`
+      );
+      setIsCalibrating(false);
+    }, 500);
   };
 
   return (
@@ -78,15 +77,15 @@ export const PatchbayView: React.FC<PatchbayViewProps> = ({
       <div className="bg-neutral-900/90 border border-neutral-800 rounded-xl p-5 shadow-lg flex flex-col md:flex-row items-center justify-between gap-4">
         <div>
           <div className="flex items-center gap-2 mb-1">
-            <span className="px-2 py-0.5 rounded bg-cyan-950 text-cyan-400 border border-cyan-800 font-mono text-[11px] font-bold">
-              MOTU / AVB ASIO MATRIX
+            <span className="px-2 py-0.5 rounded bg-amber-950 text-amber-400 border border-amber-800 font-mono text-[11px] font-bold">
+              SIMULATED PATCHBAY / NO PHYSICAL ASIO
             </span>
-            <span className="text-neutral-500 font-mono text-xs">Physical Audio Patchbay & Hardware Loop Calibration</span>
+            <span className="text-neutral-500 font-mono text-xs">Topological Anti-Feedback Validation Engine</span>
           </div>
-          <h2 className="text-lg font-bold text-white">ASIO Channel Routing & Roundtrip Calibration</h2>
+          <h2 className="text-lg font-bold text-white">ASIO Channel Routing Matrix & Latency Alignment</h2>
           <p className="text-xs text-neutral-400 mt-1">
             Assign physical MOTU 16A analog jacks to synthesizer inputs, external stereo FX loops, and mastering return.
-            Includes automatic acoustic feedback detection and millisecond latency alignment.
+            Topological feedback loop prevention engine guarantees circular signal paths are blocked.
           </p>
         </div>
 
@@ -94,10 +93,10 @@ export const PatchbayView: React.FC<PatchbayViewProps> = ({
           <button
             onClick={runLatencyCalibration}
             disabled={isCalibrating}
-            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white font-semibold text-xs shadow-md transition"
+            className="flex items-center gap-2 px-4 py-2 rounded-lg bg-neutral-800 hover:bg-neutral-700 disabled:opacity-50 text-cyan-300 border border-neutral-700 font-semibold text-xs shadow-md transition"
           >
             <Zap className="w-4 h-4" />
-            <span>{isCalibrating ? 'Measuring...' : 'Run Auto Latency Calibrator'}</span>
+            <span>{isCalibrating ? 'Calculating...' : 'Calculate Buffer Latency'}</span>
           </button>
         </div>
       </div>

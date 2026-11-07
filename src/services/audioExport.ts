@@ -1,7 +1,7 @@
 /**
  * Archival WAV Master & RPG Maker MV OGG Vorbis Export Engine
- * Encodes 24-bit/32-bit float broadcast WAV files and generates
- * RPG Maker MV-compatible OGG BGM with embedded LOOPSTART and LOOPLENGTH metadata.
+ * Encodes 24-bit/32-bit broadcast WAV files and generates genuine
+ * RPG Maker MV compliant OGG Vorbis audio with embedded LOOPSTART & LOOPLENGTH tags.
  */
 
 import { LoopRegion } from '../types/index.ts';
@@ -44,8 +44,8 @@ export function encodeWavFile(
 
   // fmt Subchunk
   writeString(view, 12, 'fmt ');
-  view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM, 16 for float format 3)
-  view.setUint16(20, bitDepth === 32 ? 3 : 1, true); // AudioFormat: 1 = PCM, 3 = IEEE Float
+  view.setUint32(16, 16, true);
+  view.setUint16(20, bitDepth === 32 ? 3 : 1, true); // 1 = PCM, 3 = IEEE Float
   view.setUint16(22, numChannels, true);
   view.setUint32(24, sampleRate, true);
   view.setUint32(28, byteRate, true);
@@ -60,7 +60,6 @@ export function encodeWavFile(
   let offset = 44;
   if (bitDepth === 24) {
     for (let i = 0; i < numSamples; i++) {
-      // Clamp to -1.0 to 1.0
       const sL = Math.max(-1, Math.min(1, left[i]));
       const sR = Math.max(-1, Math.min(1, right[i]));
 
@@ -88,253 +87,63 @@ export function encodeWavFile(
   return new Blob([buffer], { type: 'audio/wav' });
 }
 
-// 2. RPG Maker MV OGG Vorbis BGM Generator with LOOPSTART & LOOPLENGTH
-/**
- * RPG Maker MV reads standard Ogg Vorbis files and searches user comment metadata for:
- *   LOOPSTART = <sample_offset_int>
- *   LOOPLENGTH = <sample_length_int>
- *
- * Here we assemble a valid compliant Ogg container containing Vorbis identification header,
- * comment header with LOOPSTART and LOOPLENGTH tags, setup header, and Vorbis audio packets.
- */
-export function encodeOggVorbisWithLoop(
+function writeString(view: DataView, offset: number, str: string) {
+  for (let i = 0; i < str.length; i++) {
+    view.setUint8(offset + i, str.charCodeAt(i));
+  }
+}
+
+// Convert Blob to Base64
+async function blobToBase64(blob: Blob): Promise<string> {
+  const buffer = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + chunkSize)));
+  }
+  return btoa(binary);
+}
+
+// 2. Real RPG Maker MV OGG Vorbis Encoder (via native libvorbis server backend)
+export async function encodeOggVorbisWithLoop(
   left: Float32Array,
   right: Float32Array,
   sampleRate: number,
   loop: LoopRegion,
   title: string,
-  artist = 'Chiptune Hardware Workstation'
-): Blob {
+  artist = 'Chiptune Hardware Workstation',
+  fileName = 'chiptune_bgm'
+): Promise<Blob> {
   const loopStart = Math.max(0, Math.floor(loop.startSample));
   const loopLength = Math.max(1, Math.floor(loop.lengthSamples));
 
-  // Build comment string list
-  const comments = [
-    `TITLE=${title}`,
-    `ARTIST=${artist}`,
-    `LOOPSTART=${loopStart}`,
-    `LOOPLENGTH=${loopLength}`,
-    `ENCODER=Chiptune Hardware Workstation MV Vorbis Engine v1.0`
-  ];
+  // Generate intermediate uncompressed 24-bit WAV master
+  const wavBlob = encodeWavFile(left, right, sampleRate, 24);
+  const wavBase64 = await blobToBase64(wavBlob);
 
-  // Vorbis packet generation
-  const oggPages = buildCompliantOggVorbisPages(left, right, sampleRate, comments);
-  return new Blob([oggPages.buffer as ArrayBuffer], { type: 'audio/ogg' });
-}
+  // Request native FFmpeg libvorbis encoding
+  const response = await fetch('/api/export-vorbis', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      wavBase64,
+      loopStart,
+      loopLength,
+      sampleRate,
+      title,
+      artist,
+      fileName
+    })
+  });
 
-// Ogg Vorbis bitstream structure builder
-function buildCompliantOggVorbisPages(
-  left: Float32Array,
-  right: Float32Array,
-  sampleRate: number,
-  comments: string[]
-): Uint8Array {
-  const serialNo = 0x5c61116c;
-  const pages: Uint8Array[] = [];
-  let pageSeq = 0;
-
-  // Header 1: Vorbis Identification Header (Packet type 1)
-  // [0x01, 'vorbis', version=0, channels=2, sampleRate, max_br=0, nom_br=128000, min_br=0, blocksize_0/1=0xb8, framing_bit=1]
-  const idHeader = new Uint8Array(30);
-  idHeader[0] = 0x01;
-  idHeader.set(new TextEncoder().encode('vorbis'), 1);
-  const idView = new DataView(idHeader.buffer);
-  idView.setUint32(7, 0, true); // vorbis_version = 0
-  idHeader[11] = 2; // audio_channels = 2 (stereo)
-  idView.setUint32(12, sampleRate, true);
-  idView.setInt32(16, 0, true); // bitrate_maximum
-  idView.setInt32(20, 160000, true); // bitrate_nominal
-  idView.setInt32(24, 0, true); // bitrate_minimum
-  idHeader[28] = 0xb8; // blocksize_0 = 8 (256), blocksize_1 = 11 (2048)
-  idHeader[29] = 0x01; // framing_flag = 1
-
-  pages.push(createOggPage(serialNo, pageSeq++, 0, 0x02, [idHeader])); // 0x02 = Beginning of Stream (BOS)
-
-  // Header 2: Vorbis Comment Header (Packet type 3)
-  // [0x03, 'vorbis', vendor_len, vendor, user_comment_list_len, [comment_len, comment]..., framing_bit=1]
-  const vendor = 'Chiptune Studio Engine (libvorbis compatible)';
-  const vendorBytes = new TextEncoder().encode(vendor);
-  let commentPayloadSize = 7 + 4 + vendorBytes.length + 4;
-  const encodedComments: Uint8Array[] = [];
-
-  for (const c of comments) {
-    const enc = new TextEncoder().encode(c);
-    encodedComments.push(enc);
-    commentPayloadSize += 4 + enc.length;
-  }
-  commentPayloadSize += 1; // framing bit
-
-  const commentHeader = new Uint8Array(commentPayloadSize);
-  commentHeader[0] = 0x03;
-  commentHeader.set(new TextEncoder().encode('vorbis'), 1);
-  const commView = new DataView(commentHeader.buffer);
-  let commOffset = 7;
-
-  // Vendor length & vendor
-  commView.setUint32(commOffset, vendorBytes.length, true);
-  commOffset += 4;
-  commentHeader.set(vendorBytes, commOffset);
-  commOffset += vendorBytes.length;
-
-  // Comment count
-  commView.setUint32(commOffset, comments.length, true);
-  commOffset += 4;
-
-  for (const enc of encodedComments) {
-    commView.setUint32(commOffset, enc.length, true);
-    commOffset += 4;
-    commentHeader.set(enc, commOffset);
-    commOffset += enc.length;
-  }
-  commentHeader[commOffset] = 0x01; // framing bit
-
-  // Header 3: Vorbis Setup Header (Packet type 5)
-  // Minimal valid synthetic setup packet
-  const setupHeader = new Uint8Array(64);
-  setupHeader[0] = 0x05;
-  setupHeader.set(new TextEncoder().encode('vorbis'), 1);
-  for (let i = 7; i < 63; i++) {
-    setupHeader[i] = (i * 37) & 0xff;
-  }
-  setupHeader[63] = 0x01; // framing
-
-  // Package comment and setup headers in Page 1
-  pages.push(createOggPage(serialNo, pageSeq++, 0, 0x00, [commentHeader, setupHeader]));
-
-  // Data Pages: divide PCM into Vorbis data packets
-  const blockSize = 1024;
-  const numPackets = Math.ceil(left.length / blockSize);
-  let sampleCursor = 0;
-
-  for (let p = 0; p < numPackets; p++) {
-    const packetLen = Math.min(blockSize, left.length - sampleCursor);
-    const packetBytes = new Uint8Array(packetLen * 2 + 1);
-    packetBytes[0] = 0x00; // Audio packet flag
-    for (let s = 0; s < packetLen; s++) {
-      const idx = sampleCursor + s;
-      const sL = Math.max(-1, Math.min(1, left[idx]));
-      const sR = Math.max(-1, Math.min(1, right[idx]));
-      packetBytes[1 + s * 2] = Math.floor((sL + 1) * 127.5);
-      packetBytes[1 + s * 2 + 1] = Math.floor((sR + 1) * 127.5);
-    }
-
-    sampleCursor += packetLen;
-    const isEos = p === numPackets - 1;
-    const headerType = isEos ? 0x04 : 0x00; // 0x04 = End of Stream (EOS)
-
-    pages.push(createOggPage(serialNo, pageSeq++, sampleCursor, headerType, [packetBytes]));
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Real Vorbis encoder failed: ${response.status} ${response.statusText} - ${errorText}`);
   }
 
-  // Concatenate all pages
-  const totalLength = pages.reduce((acc, pg) => acc + pg.length, 0);
-  const fullOgg = new Uint8Array(totalLength);
-  let outPos = 0;
-  for (const pg of pages) {
-    fullOgg.set(pg, outPos);
-    outPos += pg.length;
-  }
-
-  return fullOgg;
-}
-
-// Low-level Ogg Page Formatter with CRC-32 checksum calculation
-function createOggPage(
-  serialNo: number,
-  pageSeq: number,
-  granulePos: number,
-  headerType: number,
-  packets: Uint8Array[]
-): Uint8Array {
-  // Build lacing values
-  const lacingValues: number[] = [];
-  for (const pkt of packets) {
-    let len = pkt.length;
-    while (len >= 255) {
-      lacingValues.push(255);
-      len -= 255;
-    }
-    lacingValues.push(len);
-  }
-
-  const numSegments = lacingValues.length;
-  const headerSize = 27 + numSegments;
-  const payloadSize = packets.reduce((acc, p) => acc + p.length, 0);
-  const page = new Uint8Array(headerSize + payloadSize);
-  const view = new DataView(page.buffer);
-
-  // 'OggS' capture pattern
-  page[0] = 0x4f; // 'O'
-  page[1] = 0x67; // 'g'
-  page[2] = 0x67; // 'g'
-  page[3] = 0x53; // 'S'
-
-  page[4] = 0; // stream_structure_version = 0
-  page[5] = headerType; // header_type_flag (BOS = 2, EOS = 4)
-
-  // Granule position (64-bit int)
-  view.setUint32(6, granulePos & 0xffffffff, true);
-  view.setUint32(10, Math.floor(granulePos / 0x100000000), true);
-
-  // Stream serial number
-  view.setUint32(14, serialNo, true);
-
-  // Page sequence number
-  view.setUint32(18, pageSeq, true);
-
-  // CRC checksum (placeholder at offset 22, computed afterwards)
-  view.setUint32(22, 0, true);
-
-  // Page segments count
-  page[26] = numSegments;
-
-  // Segment table
-  for (let i = 0; i < numSegments; i++) {
-    page[27 + i] = lacingValues[i];
-  }
-
-  // Copy packet data
-  let dataOffset = headerSize;
-  for (const pkt of packets) {
-    page.set(pkt, dataOffset);
-    dataOffset += pkt.length;
-  }
-
-  // Calculate standard Ogg CRC-32 checksum
-  const crc = calculateOggCrc(page);
-  view.setUint32(22, crc, true);
-
-  return page;
-}
-
-// Ogg CRC-32 polynomial 0x04c11db7
-function calculateOggCrc(buffer: Uint8Array): number {
-  let crc = 0;
-  for (let i = 0; i < buffer.length; i++) {
-    const byte = buffer[i];
-    crc = ((crc << 8) ^ CRC_LOOKUP[((crc >>> 24) ^ byte) & 0xff]) >>> 0;
-  }
-  return crc;
-}
-
-const CRC_LOOKUP = new Uint32Array(256);
-(function initCrcTable() {
-  for (let i = 0; i < 256; i++) {
-    let r = i << 24;
-    for (let j = 0; j < 8; j++) {
-      if (r & 0x80000000) {
-        r = ((r << 1) ^ 0x04c11db7) >>> 0;
-      } else {
-        r = (r << 1) >>> 0;
-      }
-    }
-    CRC_LOOKUP[i] = r >>> 0;
-  }
-})();
-
-function writeString(view: DataView, offset: number, str: string) {
-  for (let i = 0; i < str.length; i++) {
-    view.setUint8(offset + i, str.charCodeAt(i));
-  }
+  const oggBlob = await response.blob();
+  return oggBlob;
 }
 
 // 3. Audio Loop Seam Analysis
@@ -343,23 +152,58 @@ export function analyzeLoopSeamDiscontinuity(
   right: Float32Array,
   startSample: number,
   lengthSamples: number
-): { discontinuityDb: number; isSeamless: boolean; startLevel: number; endLevel: number } {
-  const endSample = Math.min(left.length - 1, startSample + lengthSamples);
-  if (startSample >= left.length || endSample >= left.length) {
-    return { discontinuityDb: -60, isSeamless: true, startLevel: 0, endLevel: 0 };
+): { discontinuityDb: number; isSeamless: boolean; startLevel: number; endLevel: number; error?: string } {
+  // Validate exact boundary constraints
+  if (
+    startSample < 0 ||
+    lengthSamples <= 0 ||
+    startSample >= left.length ||
+    startSample + lengthSamples > left.length
+  ) {
+    return {
+      discontinuityDb: 0,
+      isSeamless: false,
+      startLevel: 0,
+      endLevel: 0,
+      error: `Loop bounds [${startSample}, ${startSample + lengthSamples}) exceed audio buffer length (${left.length} samples)`
+    };
   }
 
-  const sampleStartL = left[startSample];
-  const sampleStartR = right[startSample];
-  const sampleEndL = left[endSample];
-  const sampleEndR = right[endSample];
+  // Seam occurs between the last sample inside the loop and the first sample of the loop
+  const firstSampleIdx = Math.floor(startSample);
+  const lastSampleIdx = Math.floor(startSample + lengthSamples - 1);
 
-  const diffL = Math.abs(sampleEndL - sampleStartL);
-  const diffR = Math.abs(sampleEndR - sampleStartR);
-  const maxDiff = Math.max(diffL, diffR);
+  const sampleStartL = left[firstSampleIdx];
+  const sampleStartR = right[firstSampleIdx];
+  const sampleEndL = left[lastSampleIdx];
+  const sampleEndR = right[lastSampleIdx];
 
-  const discontinuityDb = maxDiff > 0.00001 ? 20 * Math.log10(maxDiff) : -96;
-  const isSeamless = discontinuityDb < -30; // Seamless if delta is < -30 dB
+  const stepL = Math.abs(sampleEndL - sampleStartL);
+  const stepR = Math.abs(sampleEndR - sampleStartR);
+
+  // Also evaluate slope continuity across boundary for continuous periodic waveforms
+  const prevLastL = lastSampleIdx > 0 ? left[lastSampleIdx - 1] : sampleEndL;
+  const prevLastR = lastSampleIdx > 0 ? right[lastSampleIdx - 1] : sampleEndR;
+  const nextFirstL = firstSampleIdx + 1 < left.length ? left[firstSampleIdx + 1] : sampleStartL;
+  const nextFirstR = firstSampleIdx + 1 < right.length ? right[firstSampleIdx + 1] : sampleStartR;
+
+  const deltaWrapL = sampleStartL - sampleEndL;
+  const deltaWrapR = sampleStartR - sampleEndR;
+  const deltaLocalL = ((sampleEndL - prevLastL) + (nextFirstL - sampleStartL)) / 2;
+  const deltaLocalR = ((sampleEndR - prevLastR) + (nextFirstR - sampleStartR)) / 2;
+
+  const slopeDiffL = Math.abs(deltaWrapL - deltaLocalL);
+  const slopeDiffR = Math.abs(deltaWrapR - deltaLocalR);
+
+  // The true seam discontinuity is the minimum of step amplitude (zero crossings) and slope error (periodic waves)
+  const effectiveDiffL = Math.min(stepL, slopeDiffL);
+  const effectiveDiffR = Math.min(stepR, slopeDiffR);
+  const maxDiff = Math.max(effectiveDiffL, effectiveDiffR);
+
+  // Discontinuity in dB relative to full scale (0 dBFS = 1.0)
+  const discontinuityDb = maxDiff > 0.00001 ? 20 * Math.log10(maxDiff) : -96.0;
+  // Seamless if boundary discontinuity is below -36 dB (inaudible step)
+  const isSeamless = discontinuityDb < -36.0;
 
   return {
     discontinuityDb: Math.round(discontinuityDb * 10) / 10,
@@ -367,4 +211,44 @@ export function analyzeLoopSeamDiscontinuity(
     startLevel: (Math.abs(sampleStartL) + Math.abs(sampleStartR)) / 2,
     endLevel: (Math.abs(sampleEndL) + Math.abs(sampleEndR)) / 2
   };
+}
+
+// 4. Create real seam audition audio buffer (loops 250ms tail + 250ms head)
+export function createSeamAuditionBuffer(
+  left: Float32Array,
+  right: Float32Array,
+  sampleRate: number,
+  startSample: number,
+  lengthSamples: number,
+  windowMs = 250
+): { left: Float32Array; right: Float32Array; length: number } {
+  const windowSamples = Math.floor((sampleRate * windowMs) / 1000);
+  const halfWindow = Math.min(windowSamples, Math.floor(lengthSamples / 2));
+  const totalLength = halfWindow * 2;
+
+  const outL = new Float32Array(totalLength);
+  const outR = new Float32Array(totalLength);
+
+  const tailStart = Math.max(0, startSample + lengthSamples - halfWindow);
+  const headStart = startSample;
+
+  // Copy tail (approaching loop point) into first half
+  for (let i = 0; i < halfWindow; i++) {
+    const src = tailStart + i;
+    if (src < left.length) {
+      outL[i] = left[src];
+      outR[i] = right[src];
+    }
+  }
+
+  // Copy head (after loop point) into second half
+  for (let i = 0; i < halfWindow; i++) {
+    const src = headStart + i;
+    if (src < left.length) {
+      outL[halfWindow + i] = left[src];
+      outR[halfWindow + i] = right[src];
+    }
+  }
+
+  return { left: outL, right: outR, length: totalLength };
 }

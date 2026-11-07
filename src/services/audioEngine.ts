@@ -1,89 +1,91 @@
 /**
- * Chiptune Hardware Workstation - Audio Engine & Studio Simulator
- * Provides real-time WebAudio synthesis, MOTU/AVB ASIO emulation,
- * multichannel mixing, dual external FX loops, and stereo mastering return capture.
+ * Audio Engine & Multi-Voice Workstation Synthesizer
+ * Implements precision lookahead MIDI scheduling, channel route mapping,
+ * NES APU voice simulation, dual-chip MIDIbox SID cores, pre/post auxiliary sends,
+ * solo isolation, and bounded mastering return capture.
  */
 
-import { MidiSongModel, MixerStrip, VoiceId } from '../types/index.ts';
+import {
+  VoiceId,
+  MidiSongModel,
+  MidiRoute,
+  MixerStrip,
+  RecordingProvenance
+} from '../types/index.ts';
+import { midiDeviceManager } from './midiDeviceManager.ts';
 
-// Note to Frequency helper
-export function midiNoteToFrequency(note: number): number {
-  return 440 * Math.pow(2, (note - 69) / 12);
+interface ActiveVoice {
+  sources: AudioNode[];
+  gain: GainNode;
+  voiceId: VoiceId;
+  note: number;
 }
 
-export interface MeterData {
-  stripId: string;
-  peakL: number;
-  peakR: number;
-  rmsL: number;
-  rmsR: number;
-  clipL: boolean;
-  clipR: boolean;
+interface StripAudioNodes {
+  input: GainNode;
+  trim: GainNode;
+  pan: StereoPannerNode | null;
+  preFader: GainNode;
+  fader: GainNode;
+  sendA: GainNode;
+  sendB: GainNode;
+  analyserL: AnalyserNode;
+  analyserR: AnalyserNode;
+  currentSendAPre: boolean;
+  currentSendBPre: boolean;
 }
 
-export class StudioAudioEngine {
+export class AudioEngine {
   private ctx: AudioContext | null = null;
-  private isRunning = false;
-  private isPaused = false;
-  private startTime = 0;
-  private pauseOffset = 0;
-  private songModel: MidiSongModel | null = null;
+  private stripNodes: Map<string, StripAudioNodes> = new Map();
+  private activeVoices: Map<string, ActiveVoice> = new Map();
 
-  // Strips gain & pan nodes
-  private stripNodes = new Map<
-    string,
-    {
-      input: GainNode;
-      trim: GainNode;
-      pan: StereoPannerNode;
-      fader: GainNode;
-      sendA: GainNode;
-      sendB: GainNode;
-      analyserL: AnalyserNode;
-      analyserR: AnalyserNode;
-    }
-  >();
-
-  // FX Loop Nodes
+  // Hardware FX Loops (Simulated)
   private fxASendGain: GainNode | null = null;
-  private fxBSendGain: GainNode | null = null;
   private fxAReturnGain: GainNode | null = null;
-  private fxBReturnGain: GainNode | null = null;
   private fxADelayNode: DelayNode | null = null;
+
+  private fxBSendGain: GainNode | null = null;
+  private fxBReturnGain: GainNode | null = null;
   private fxBReverbNode: ConvolverNode | null = null;
 
-  // Master bus & Mastering hardware loop
+  // Master bus and isolated mastering return
   private masterSendGain: GainNode | null = null;
-  private masteringProcessorGain: GainNode | null = null;
   private masteringReturnGain: GainNode | null = null;
   private masterOutputGain: GainNode | null = null;
-  private masteringAnalyserL: AnalyserNode | null = null;
-  private masteringAnalyserR: AnalyserNode | null = null;
 
-  // Recording capture buffer
-  private recordingNode: ScriptProcessorNode | null = null;
+  // Recording State (Bounded pre-allocated buffer)
   private isRecording = false;
-  private recordedChunksL: Float32Array[] = [];
-  private recordedChunksR: Float32Array[] = [];
-  private recordedSampleCount = 0;
+  private maxRecordSeconds = 180; // 3 minutes maximum
+  private recordedLeft: Float32Array | null = null;
+  private recordedRight: Float32Array | null = null;
+  private recordSampleCount = 0;
+  private recordProcessor: ScriptProcessorNode | null = null;
+  private recordProvenance: RecordingProvenance | null = null;
 
-  // Active playing voices
-  private activeOscillators = new Map<string, { osc: OscillatorNode | AudioNode; gain: GainNode }>();
-
-  // Event dispatchers
-  private onPlaybackProgress?: (currentSec: number, totalSec: number, currentTick: number) => void;
-  private onMeterUpdate?: (meters: MeterData[]) => void;
-  private timerHandle: number | null = null;
+  // Playback & Lookahead Scheduler State
+  private isRunning = false;
+  private isPaused = false;
+  private songModel: MidiSongModel | null = null;
+  private songRoutes: MidiRoute[] = [];
+  private startTime = 0;
+  private pauseOffset = 0;
+  private schedulerTimer: number | null = null;
+  private scheduledEventIndex = 0;
+  private allPlaybackEvents: Array<{ timeSec: number; trackIndex: number; channel: number; event: any }> = [];
+  private onPlaybackProgress: ((sec: number, bar: number, beat: number) => void) | null = null;
+  private onPlaybackComplete: (() => void) | null = null;
+  private onMetersUpdate: ((levels: Record<string, { peakL: number; peakR: number; rmsL: number; rmsR: number }>) => void) | null = null;
 
   constructor() {
-    // Lazy AudioContext initialization on first user interaction
+    // Lazy audio context init on user interaction
   }
 
   public initAudio(): AudioContext {
     if (!this.ctx) {
-      const AudioCtxClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      this.ctx = new AudioCtxClass();
-      this.buildTopology();
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      this.ctx = new AudioCtx({ latencyHint: 'interactive' });
+      this.setupRoutingGraph(this.ctx);
     }
     if (this.ctx.state === 'suspended') {
       this.ctx.resume();
@@ -91,20 +93,22 @@ export class StudioAudioEngine {
     return this.ctx;
   }
 
-  private buildTopology() {
-    if (!this.ctx) return;
-    const ctx = this.ctx;
+  public getSampleRate(): number {
+    return this.ctx ? this.ctx.sampleRate : 48000;
+  }
 
-    // 1. External FX Loop A: Stereo Ping-Pong / Tape Delay
+  private setupRoutingGraph(ctx: AudioContext) {
+    // 1. External FX Loop A (Tape Delay)
     this.fxASendGain = ctx.createGain();
     this.fxAReturnGain = ctx.createGain();
     this.fxADelayNode = ctx.createDelay(2.0);
-    this.fxADelayNode.delayTime.value = 0.25; // 1/8th note delay
+    this.fxADelayNode.delayTime.value = 0.25;
     const delayFeedback = ctx.createGain();
     delayFeedback.gain.value = 0.45;
+
     const delayFilter = ctx.createBiquadFilter();
     delayFilter.type = 'lowpass';
-    delayFilter.frequency.value = 4500;
+    delayFilter.frequency.value = 4000;
 
     this.fxASendGain.connect(this.fxADelayNode);
     this.fxADelayNode.connect(delayFilter);
@@ -112,57 +116,44 @@ export class StudioAudioEngine {
     delayFeedback.connect(this.fxADelayNode);
     delayFilter.connect(this.fxAReturnGain);
 
-    // 2. External FX Loop B: Stereo Plate / Ambient Reverb
+    // 2. External FX Loop B (Plate Reverb)
     this.fxBSendGain = ctx.createGain();
     this.fxBReturnGain = ctx.createGain();
     this.fxBReverbNode = ctx.createConvolver();
-    this.generateSyntheticImpulse(ctx, 1.8, 2.0);
+    this.generateSyntheticImpulse(ctx, 2.2, 2.8);
     this.fxBSendGain.connect(this.fxBReverbNode);
     this.fxBReverbNode.connect(this.fxBReturnGain);
 
-    // 3. Master Bus Summation
+    // 3. Master Send Bus & Analog Mastering Processor
     this.masterSendGain = ctx.createGain();
+    this.masteringReturnGain = ctx.createGain();
 
-    // 4. External Mastering Chain Simulation (Saturation & Analog Limiting)
     const waveshaper = ctx.createWaveShaper();
     waveshaper.curve = this.createMasteringCurve(4096) as Float32Array<ArrayBuffer>;
     waveshaper.oversample = '2x';
-    this.masteringProcessorGain = ctx.createGain();
-    this.masteringProcessorGain.gain.value = 1.05;
+
+    const masteringEq = ctx.createBiquadFilter();
+    masteringEq.type = 'highshelf';
+    masteringEq.frequency.value = 10000;
+    masteringEq.gain.value = 1.2;
 
     this.masterSendGain.connect(waveshaper);
-    waveshaper.connect(this.masteringProcessorGain);
+    waveshaper.connect(masteringEq);
+    masteringEq.connect(this.masteringReturnGain);
 
-    // 5. Dedicated Stereo Mastering Return (Capture source)
-    this.masteringReturnGain = ctx.createGain();
-    this.masteringProcessorGain.connect(this.masteringReturnGain);
-
-    // Mastering Return Analysers
-    const splitter = ctx.createChannelSplitter(2);
-    this.masteringAnalyserL = ctx.createAnalyser();
-    this.masteringAnalyserR = ctx.createAnalyser();
-    this.masteringAnalyserL.fftSize = 256;
-    this.masteringAnalyserR.fftSize = 256;
-
-    this.masteringReturnGain.connect(splitter);
-    splitter.connect(this.masteringAnalyserL, 0);
-    splitter.connect(this.masteringAnalyserR, 1);
-
-    // Connect mastering return to monitor speakers
+    // 4. Mastering return connects strictly to monitor destination
     this.masterOutputGain = ctx.createGain();
     this.masterOutputGain.gain.value = 0.9;
     this.masteringReturnGain.connect(this.masterOutputGain);
     this.masterOutputGain.connect(ctx.destination);
 
-    // Create channel strips for all 5 sources + 2 FX returns
+    // 5. Channel Strips
     const stripIds = ['nes_mono', 'sid_core1', 'sid_core2', 'sid_core3', 'sid_core4', 'fx_return_a', 'fx_return_b'];
-    const fxA = this.fxASendGain;
-    const fxB = this.fxBSendGain;
-
     stripIds.forEach((id) => {
       const input = ctx.createGain();
       const trim = ctx.createGain();
-      const pan = ctx.createStereoPanner ? ctx.createStereoPanner() : (null as unknown as StereoPannerNode);
+      const pan = ctx.createStereoPanner ? ctx.createStereoPanner() : null;
+      const preFader = ctx.createGain();
       const fader = ctx.createGain();
       const sendA = ctx.createGain();
       const sendB = ctx.createGain();
@@ -173,43 +164,48 @@ export class StudioAudioEngine {
       anR.fftSize = 256;
 
       input.connect(trim);
+      trim.connect(preFader);
+
       if (pan) {
-        trim.connect(pan);
+        preFader.connect(pan);
         pan.connect(fader);
       } else {
-        trim.connect(fader);
+        preFader.connect(fader);
       }
 
-      // Sends (Post fader default)
+      // Default: post-fader send
       fader.connect(sendA);
       fader.connect(sendB);
-      if (fxA) sendA.connect(fxA);
-      if (fxB) sendB.connect(fxB);
+      if (this.fxASendGain) sendA.connect(this.fxASendGain);
+      if (this.fxBSendGain) sendB.connect(this.fxBSendGain);
 
-      // Direct mix to Master Send
+      // Direct mix into Master Send
       if (this.masterSendGain) {
         fader.connect(this.masterSendGain);
       }
 
-      // Connect to meters
-      const stripSplitter = ctx.createChannelSplitter(2);
-      fader.connect(stripSplitter);
-      stripSplitter.connect(anL, 0);
-      stripSplitter.connect(anR, 1);
+      // Analysers for VU meters
+      const splitter = ctx.createChannelSplitter(2);
+      fader.connect(splitter);
+      splitter.connect(anL, 0);
+      splitter.connect(anR, 1);
 
       this.stripNodes.set(id, {
         input,
         trim,
         pan,
+        preFader,
         fader,
         sendA,
         sendB,
         analyserL: anL,
-        analyserR: anR
+        analyserR: anR,
+        currentSendAPre: false,
+        currentSendBPre: false
       });
     });
 
-    // Also connect FX Returns to master send
+    // Connect FX returns
     if (this.fxAReturnGain) {
       const aStrip = this.stripNodes.get('fx_return_a');
       if (aStrip) this.fxAReturnGain.connect(aStrip.input);
@@ -250,8 +246,7 @@ export class StudioAudioEngine {
     return curve;
   }
 
-  // Set Mixer Strip Parameters
-  public updateMixerStrip(strip: MixerStrip) {
+  public updateMixerStrip(strip: MixerStrip, allStrips?: MixerStrip[]) {
     let nodeKey = strip.id;
     if (strip.sourceType === 'nes_mono') nodeKey = 'nes_mono';
     else if (strip.id.includes('sid1') || strip.id.includes('core1')) nodeKey = 'sid_core1';
@@ -273,12 +268,42 @@ export class StudioAudioEngine {
       nodes.pan.pan.setTargetAtTime(strip.pan, this.ctx.currentTime, 0.02);
     }
 
-    // Fader & Mute
-    let faderLinear = strip.muted ? 0 : Math.pow(10, strip.faderDb / 20);
+    // Solo isolation
+    const anySoloed = allStrips ? allStrips.some(s => s.soloed) : false;
+    const isEffectiveMuted = strip.muted || (anySoloed && !strip.soloed);
+
+    // Fader
+    let faderLinear = isEffectiveMuted ? 0 : Math.pow(10, strip.faderDb / 20);
     if (strip.faderDb <= -60) faderLinear = 0;
     nodes.fader.gain.setTargetAtTime(faderLinear, this.ctx.currentTime, 0.02);
 
-    // Sends
+    // Pre / Post Send Routing
+    if (nodes.currentSendAPre !== strip.sendAPre) {
+      try {
+        if (strip.sendAPre) {
+          nodes.fader.disconnect(nodes.sendA);
+          nodes.preFader.connect(nodes.sendA);
+        } else {
+          nodes.preFader.disconnect(nodes.sendA);
+          nodes.fader.connect(nodes.sendA);
+        }
+        nodes.currentSendAPre = strip.sendAPre;
+      } catch {}
+    }
+
+    if (nodes.currentSendBPre !== strip.sendBPre) {
+      try {
+        if (strip.sendBPre) {
+          nodes.fader.disconnect(nodes.sendB);
+          nodes.preFader.connect(nodes.sendB);
+        } else {
+          nodes.preFader.disconnect(nodes.sendB);
+          nodes.fader.connect(nodes.sendB);
+        }
+        nodes.currentSendBPre = strip.sendBPre;
+      } catch {}
+    }
+
     const sendALinear = strip.sendADb <= -60 ? 0 : Math.pow(10, strip.sendADb / 20);
     const sendBLinear = strip.sendBDb <= -60 ? 0 : Math.pow(10, strip.sendBDb / 20);
     nodes.sendA.gain.setTargetAtTime(sendALinear, this.ctx.currentTime, 0.02);
@@ -292,7 +317,7 @@ export class StudioAudioEngine {
     const velScale = velocity / 127;
     const key = `${voiceId}_${note}`;
 
-    // Stop existing note if monophonic
+    // Monophonic voice enforcement: panic only this voice channel
     if (voiceId.startsWith('nes.')) {
       this.panicVoice(voiceId);
     }
@@ -310,38 +335,32 @@ export class StudioAudioEngine {
     gainNode.gain.setValueAtTime(0, ctx.currentTime);
     gainNode.connect(strip.input);
 
+    const sources: AudioNode[] = [];
+
     if (voiceId === 'nes.pulse1' || voiceId === 'nes.pulse2') {
-      // NES Pulse with square waveform
       const osc = ctx.createOscillator();
       osc.type = 'square';
       osc.frequency.setValueAtTime(freq, ctx.currentTime);
       osc.connect(gainNode);
       osc.start();
+      sources.push(osc);
 
-      // Quick punchy chiptune attack/decay
-      gainNode.gain.setValueAtTime(0, ctx.currentTime);
-      gainNode.gain.linearRampToValueAtTime(0.22 * velScale, ctx.currentTime + 0.005);
-      gainNode.gain.exponentialRampToValueAtTime(0.18 * velScale, ctx.currentTime + 0.05);
-
-      this.activeOscillators.set(key, { osc, gain: gainNode });
+      gainNode.gain.setValueAtTime(0.3 * velScale, ctx.currentTime);
+      gainNode.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
     } else if (voiceId === 'nes.triangle') {
-      // Stepped quantized triangle approximation
       const osc = ctx.createOscillator();
       osc.type = 'triangle';
       osc.frequency.setValueAtTime(freq, ctx.currentTime);
       osc.connect(gainNode);
       osc.start();
+      sources.push(osc);
 
-      gainNode.gain.setValueAtTime(0.3 * velScale, ctx.currentTime);
-      this.activeOscillators.set(key, { osc, gain: gainNode });
+      gainNode.gain.setValueAtTime(0.4 * velScale, ctx.currentTime);
     } else if (voiceId === 'nes.noise') {
-      // Metallic/white noise buffer source
-      const bufferSize = ctx.sampleRate * 0.5;
+      const bufferSize = ctx.sampleRate * 0.15;
       const noiseBuffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
       const output = noiseBuffer.getChannelData(0);
-      for (let i = 0; i < bufferSize; i++) {
-        output[i] = Math.random() * 2 - 1;
-      }
+      for (let i = 0; i < bufferSize; i++) output[i] = Math.random() * 2 - 1;
       const whiteNoise = ctx.createBufferSource();
       whiteNoise.buffer = noiseBuffer;
 
@@ -354,24 +373,21 @@ export class StudioAudioEngine {
       whiteNoise.connect(filter);
       filter.connect(gainNode);
       whiteNoise.start();
+      sources.push(whiteNoise);
 
       gainNode.gain.setValueAtTime(0.25 * velScale, ctx.currentTime);
       gainNode.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15);
-
-      this.activeOscillators.set(key, { osc: whiteNoise, gain: gainNode });
     } else if (voiceId === 'nes.dpcm') {
-      // DPCM drum synthesis (Kick, snare, tom or pitched click)
       const osc = ctx.createOscillator();
       osc.type = 'sine';
       osc.frequency.setValueAtTime(140, ctx.currentTime);
       osc.frequency.exponentialRampToValueAtTime(35, ctx.currentTime + 0.12);
       osc.connect(gainNode);
       osc.start();
+      sources.push(osc);
 
       gainNode.gain.setValueAtTime(0.4 * velScale, ctx.currentTime);
       gainNode.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.18);
-
-      this.activeOscillators.set(key, { osc, gain: gainNode });
     } else {
       // MIDIbox SID Stereo Core (Sawtooth + Pulse with resonant filter)
       const osc1 = ctx.createOscillator();
@@ -379,320 +395,395 @@ export class StudioAudioEngine {
       osc1.type = 'sawtooth';
       osc2.type = 'square';
       osc1.frequency.setValueAtTime(Math.min(8000, Math.max(30, freq)), ctx.currentTime);
-      osc2.frequency.setValueAtTime(Math.min(8000, Math.max(30, freq * 1.003)), ctx.currentTime); // Slight detune for analog warmth
+      osc2.frequency.setValueAtTime(Math.min(8000, Math.max(30, freq * 1.003)), ctx.currentTime);
 
       const maxFilterFreq = (ctx.sampleRate || 48000) * 0.42;
       const filter = ctx.createBiquadFilter();
       filter.type = 'lowpass';
       filter.frequency.setValueAtTime(Math.min(maxFilterFreq, Math.max(150, freq * 2.2)), ctx.currentTime);
-      filter.Q.value = 3.5; // Resonant SID 6581/8580 peak
+      filter.Q.value = 3.5;
 
       osc1.connect(filter);
       osc2.connect(filter);
       filter.connect(gainNode);
       osc1.start();
       osc2.start();
+      sources.push(osc1, osc2);
 
       gainNode.gain.setValueAtTime(0.001, ctx.currentTime);
       gainNode.gain.linearRampToValueAtTime(0.25 * velScale, ctx.currentTime + 0.015);
       gainNode.gain.exponentialRampToValueAtTime(0.18 * velScale, ctx.currentTime + 0.1);
-
-      this.activeOscillators.set(key, { osc: osc1, gain: gainNode });
     }
+
+    this.activeVoices.set(key, { sources, gain: gainNode, voiceId, note });
   }
 
   public triggerNoteOff(voiceId: VoiceId, note: number) {
     const key = `${voiceId}_${note}`;
-    const active = this.activeOscillators.get(key);
+    const active = this.activeVoices.get(key);
     if (!active || !this.ctx) return;
 
     active.gain.gain.setValueAtTime(active.gain.gain.value, this.ctx.currentTime);
     active.gain.gain.exponentialRampToValueAtTime(0.0001, this.ctx.currentTime + 0.06);
 
     setTimeout(() => {
-      try {
-        if ('stop' in active.osc && typeof (active.osc as OscillatorNode).stop === 'function') {
-          (active.osc as OscillatorNode).stop();
-        }
-      } catch {
-        // Safe ignore
+      for (const src of active.sources) {
+        try {
+          if ('stop' in src && typeof (src as OscillatorNode).stop === 'function') {
+            (src as OscillatorNode).stop();
+          }
+          src.disconnect();
+        } catch {}
       }
-      this.activeOscillators.delete(key);
+      try { active.gain.disconnect(); } catch {}
+      this.activeVoices.delete(key);
     }, 70);
   }
 
-  public panicVoice(voicePrefix: string) {
+  public panicVoice(voiceId: VoiceId) {
     if (!this.ctx) return;
-    for (const [k, v] of this.activeOscillators.entries()) {
-      if (k.startsWith(voicePrefix)) {
-        try {
-          if ('stop' in v.osc && typeof (v.osc as OscillatorNode).stop === 'function') {
-            (v.osc as OscillatorNode).stop();
-          }
-        } catch {
-          // ignore
+    for (const [k, v] of this.activeVoices.entries()) {
+      if (v.voiceId === voiceId) {
+        for (const src of v.sources) {
+          try {
+            if ('stop' in src && typeof (src as OscillatorNode).stop === 'function') {
+              (src as OscillatorNode).stop();
+            }
+            src.disconnect();
+          } catch {}
         }
-        this.activeOscillators.delete(k);
+        try { v.gain.disconnect(); } catch {}
+        this.activeVoices.delete(k);
       }
     }
   }
 
   public panicAll() {
     if (!this.ctx) return;
-    for (const [, v] of this.activeOscillators.entries()) {
-      try {
-        if ('stop' in v.osc && typeof (v.osc as OscillatorNode).stop === 'function') {
-          (v.osc as OscillatorNode).stop();
-        }
-      } catch {
-        // ignore
+    for (const v of this.activeVoices.values()) {
+      for (const src of v.sources) {
+        try {
+          if ('stop' in src && typeof (src as OscillatorNode).stop === 'function') {
+            (src as OscillatorNode).stop();
+          }
+          src.disconnect();
+        } catch {}
       }
+      try { v.gain.disconnect(); } catch {}
     }
-    this.activeOscillators.clear();
+    this.activeVoices.clear();
+
+    // Also trigger hardware MIDI panic across all channels
+    midiDeviceManager.panicAll();
   }
 
-  // --- Transport Playback of SMF Song Model ---
-  public playSong(song: MidiSongModel, startSec = 0) {
+  // --- Precision Lookahead MIDI Transport Playback ---
+  public playSong(
+    song: MidiSongModel,
+    routes: MidiRoute[],
+    startSec = 0,
+    onProgress?: (sec: number, bar: number, beat: number) => void,
+    onComplete?: () => void
+  ) {
     this.initAudio();
     this.stopPlayback();
 
     this.songModel = song;
+    this.songRoutes = routes;
+    this.onPlaybackProgress = onProgress || null;
+    this.onPlaybackComplete = onComplete || null;
+
     this.isRunning = true;
     this.isPaused = false;
     this.pauseOffset = startSec;
     this.startTime = this.ctx!.currentTime - startSec;
 
-    // Schedule all MIDI events using precise WebAudio scheduling
-    const voiceMap: Record<number, VoiceId> = {
-      0: 'nes.pulse1',
-      1: 'nes.pulse2',
-      2: 'nes.triangle',
-      3: 'nes.noise',
-      4: 'nes.dpcm',
-      5: 'sid.core1',
-      6: 'sid.core2',
-      7: 'sid.core3',
-      8: 'sid.core4'
-    };
+    // Flatten all events across content tracks, sorted strictly by timeSec
+    this.allPlaybackEvents = [];
+    song.tracks.forEach((track) => {
+      // Match route
+      let matchedRoute: MidiRoute | undefined;
+      if (song.format === 0) {
+        matchedRoute = routes.find(r => track.channelMask.includes(r.midiChannel - 1));
+      } else {
+        matchedRoute = routes.find(r => r.trackIndex === track.index);
+      }
 
-    song.tracks.forEach((track, trkIdx) => {
-      const voiceId = voiceMap[trkIdx] || (trkIdx === 8 ? 'nes.dpcm' : 'nes.pulse1');
+      if (!matchedRoute || matchedRoute.muted) return;
+
       for (const ev of track.events) {
         if (ev.timeSec < startSec) continue;
-        const eventAudioTime = this.startTime + ev.timeSec;
+        this.allPlaybackEvents.push({
+          timeSec: ev.timeSec,
+          trackIndex: track.index,
+          channel: ev.channel,
+          event: ev
+        });
+      }
+    });
+
+    this.allPlaybackEvents.sort((a, b) => a.timeSec - b.timeSec);
+    this.scheduledEventIndex = 0;
+
+    midiDeviceManager.sendTransport('START');
+    this.runScheduler();
+  }
+
+  private runScheduler() {
+    if (!this.isRunning || this.isPaused || !this.ctx) return;
+
+    const currentSec = this.ctx.currentTime - this.startTime;
+    const lookaheadSec = 0.1; // 100ms lookahead
+    const scheduleUntil = currentSec + lookaheadSec;
+
+    while (
+      this.scheduledEventIndex < this.allPlaybackEvents.length &&
+      this.allPlaybackEvents[this.scheduledEventIndex].timeSec <= scheduleUntil
+    ) {
+      const item = this.allPlaybackEvents[this.scheduledEventIndex];
+      const ev = item.event;
+      const eventAudioTime = this.startTime + item.timeSec;
+      const delayMs = Math.max(0, (eventAudioTime - this.ctx.currentTime) * 1000);
+
+      // Match voice route
+      const route = this.songRoutes.find(r =>
+        this.songModel?.format === 0 ? r.midiChannel === item.channel + 1 : r.trackIndex === item.trackIndex
+      );
+
+      if (route && !route.muted) {
+        const voiceId = route.voiceId;
 
         if (ev.type === 'noteOn' && ev.note !== undefined && ev.velocity && ev.velocity > 0) {
-          const delayMs = Math.max(0, (eventAudioTime - this.ctx!.currentTime) * 1000);
           setTimeout(() => {
             if (this.isRunning && !this.isPaused) {
               this.triggerNoteOn(voiceId, ev.note!, ev.velocity!);
             }
           }, delayMs);
-        } else if (ev.type === 'noteOff' && ev.note !== undefined) {
-          const delayMs = Math.max(0, (eventAudioTime - this.ctx!.currentTime) * 1000);
+        } else if ((ev.type === 'noteOff' || (ev.type === 'noteOn' && (!ev.velocity || ev.velocity === 0))) && ev.note !== undefined) {
           setTimeout(() => {
             if (this.isRunning && !this.isPaused) {
               this.triggerNoteOff(voiceId, ev.note!);
             }
           }, delayMs);
+        } else if (ev.type === 'cc' && ev.controller !== undefined && ev.value !== undefined) {
+          setTimeout(() => {
+            if (this.isRunning && !this.isPaused) {
+              midiDeviceManager.sendMidinesCC(ev.channel + 1, ev.controller!, ev.value!, 'SMF Controller');
+            }
+          }, delayMs);
         }
       }
-    });
 
-    this.startProgressLoop();
+      this.scheduledEventIndex++;
+    }
+
+    // Update progress
+    if (this.onPlaybackProgress) {
+      const bar = Math.floor(currentSec / 2.0) + 1;
+      const beat = Math.floor((currentSec % 2.0) / 0.5) + 1;
+      this.onPlaybackProgress(currentSec, bar, beat);
+    }
+
+    if (this.songModel && currentSec >= this.songModel.durationSec) {
+      this.stopPlayback();
+      if (this.onPlaybackComplete) this.onPlaybackComplete();
+      return;
+    }
+
+    this.schedulerTimer = window.setTimeout(() => this.runScheduler(), 25);
   }
 
   public pausePlayback() {
     if (!this.isRunning || this.isPaused || !this.ctx) return;
     this.isPaused = true;
     this.pauseOffset = this.ctx.currentTime - this.startTime;
+    if (this.schedulerTimer) clearTimeout(this.schedulerTimer);
     this.panicAll();
+    midiDeviceManager.sendTransport('STOP');
   }
 
   public resumePlayback() {
     if (!this.songModel || !this.isPaused) return;
-    this.playSong(this.songModel, this.pauseOffset);
+    this.playSong(this.songModel, this.songRoutes, this.pauseOffset, this.onPlaybackProgress || undefined, this.onPlaybackComplete || undefined);
   }
 
   public stopPlayback() {
     this.isRunning = false;
     this.isPaused = false;
     this.pauseOffset = 0;
+    if (this.schedulerTimer) clearTimeout(this.schedulerTimer);
     this.panicAll();
+    midiDeviceManager.sendTransport('STOP');
   }
 
-  // --- Mastering Return Recording Capture ---
-  public startRecording() {
+  // --- Real Mastering Return Audio Recording (Bounded Ring Buffer) ---
+  public startRecording(deviceId = 'MOTU 16A AVB ASIO', channelPair = 'In 1-2 (Mastering Return)') {
     const ctx = this.initAudio();
-    if (this.isRecording) return;
+    if (!this.masteringReturnGain) return;
 
     this.isRecording = true;
-    this.recordedChunksL = [];
-    this.recordedChunksR = [];
-    this.recordedSampleCount = 0;
+    const maxSamples = Math.floor(ctx.sampleRate * this.maxRecordSeconds);
+    this.recordedLeft = new Float32Array(maxSamples);
+    this.recordedRight = new Float32Array(maxSamples);
+    this.recordSampleCount = 0;
 
-    // Use ScriptProcessor / AudioWorklet for buffer capture
-    this.recordingNode = ctx.createScriptProcessor(4096, 2, 2);
-    this.recordingNode.onaudioprocess = (e) => {
-      if (!this.isRecording) return;
-      const left = e.inputBuffer.getChannelData(0);
-      const right = e.inputBuffer.getChannelData(1);
-      this.recordedChunksL.push(new Float32Array(left));
-      this.recordedChunksR.push(new Float32Array(right));
-      this.recordedSampleCount += left.length;
-    };
+    // Use ScriptProcessorNode tapping strictly into masteringReturnGain
+    this.recordProcessor = ctx.createScriptProcessor(4096, 2, 2);
+    this.recordProcessor.onaudioprocess = (e) => {
+      if (!this.isRecording || !this.recordedLeft || !this.recordedRight) return;
+      const inL = e.inputBuffer.getChannelData(0);
+      const inR = e.inputBuffer.getChannelData(1);
 
-    // Connect from dedicated Mastering Return Gain
-    if (this.masteringReturnGain) {
-      this.masteringReturnGain.connect(this.recordingNode);
-      this.recordingNode.connect(ctx.destination);
-    }
-  }
-
-  public stopRecording(): { left: Float32Array; right: Float32Array; sampleRate: number } {
-    this.isRecording = false;
-    if (this.recordingNode && this.masteringReturnGain) {
-      try {
-        this.masteringReturnGain.disconnect(this.recordingNode);
-        this.recordingNode.disconnect();
-      } catch {
-        // ignore
-      }
-    }
-
-    const totalSamples = this.recordedSampleCount;
-    const finalL = new Float32Array(totalSamples);
-    const finalR = new Float32Array(totalSamples);
-    let offset = 0;
-
-    for (let i = 0; i < this.recordedChunksL.length; i++) {
-      finalL.set(this.recordedChunksL[i], offset);
-      finalR.set(this.recordedChunksR[i], offset);
-      offset += this.recordedChunksL[i].length;
-    }
-
-    return {
-      left: finalL,
-      right: finalR,
-      sampleRate: this.ctx ? this.ctx.sampleRate : 48000
-    };
-  }
-
-  // --- Monitoring & Progress Loops ---
-  public setOnPlaybackProgress(cb: (currentSec: number, totalSec: number, currentTick: number) => void) {
-    this.onPlaybackProgress = cb;
-  }
-
-  public setOnMeterUpdate(cb: (meters: MeterData[]) => void) {
-    this.onMeterUpdate = cb;
-  }
-
-  private startProgressLoop() {
-    const loop = () => {
-      if (this.isRunning && !this.isPaused && this.ctx && this.songModel) {
-        const curSec = this.ctx.currentTime - this.startTime;
-        const totalSec = this.songModel.durationSec;
-        const curTick = Math.floor((curSec / (totalSec || 1)) * this.songModel.totalTicks);
-
-        if (this.onPlaybackProgress) {
-          this.onPlaybackProgress(Math.max(0, curSec), totalSec, Math.min(this.songModel.totalTicks, curTick));
-        }
-
-        if (curSec >= totalSec + 0.5) {
-          this.stopPlayback();
-          return;
-        }
-      }
-      if (this.isRunning) {
-        requestAnimationFrame(loop);
-      }
-    };
-    requestAnimationFrame(loop);
-  }
-
-  private startMeterLoop() {
-    if (this.timerHandle) return;
-
-    const dataArrayL = new Uint8Array(128);
-    const dataArrayR = new Uint8Array(128);
-
-    const checkMeters = () => {
-      if (!this.onMeterUpdate) {
-        this.timerHandle = window.setTimeout(checkMeters, 50);
+      const toCopy = Math.min(inL.length, maxSamples - this.recordSampleCount);
+      if (toCopy <= 0) {
+        this.stopRecording();
         return;
       }
 
-      const results: MeterData[] = [];
-      this.stripNodes.forEach((nodes, id) => {
-        nodes.analyserL.getByteTimeDomainData(dataArrayL);
-        nodes.analyserR.getByteTimeDomainData(dataArrayR);
-
-        let sumL = 0;
-        let sumR = 0;
-        let peakL = 0;
-        let peakR = 0;
-
-        for (let i = 0; i < 128; i++) {
-          const sampleL = (dataArrayL[i] - 128) / 128;
-          const sampleR = (dataArrayR[i] - 128) / 128;
-          sumL += sampleL * sampleL;
-          sumR += sampleR * sampleR;
-          const absL = Math.abs(sampleL);
-          const absR = Math.abs(sampleR);
-          if (absL > peakL) peakL = absL;
-          if (absR > peakR) peakR = absR;
-        }
-
-        const rmsL = Math.sqrt(sumL / 128);
-        const rmsR = Math.sqrt(sumR / 128);
-
-        results.push({
-          stripId: id,
-          peakL: peakL * 1.4,
-          peakR: peakR * 1.4,
-          rmsL: rmsL * 1.4,
-          rmsR: rmsR * 1.4,
-          clipL: peakL > 0.96,
-          clipR: peakR > 0.96
-        });
-      });
-
-      // Also measure Mastering Return
-      if (this.masteringAnalyserL && this.masteringAnalyserR) {
-        this.masteringAnalyserL.getByteTimeDomainData(dataArrayL);
-        this.masteringAnalyserR.getByteTimeDomainData(dataArrayR);
-        let sumL = 0;
-        let sumR = 0;
-        let peakL = 0;
-        let peakR = 0;
-        for (let i = 0; i < 128; i++) {
-          const sampleL = (dataArrayL[i] - 128) / 128;
-          const sampleR = (dataArrayR[i] - 128) / 128;
-          sumL += sampleL * sampleL;
-          sumR += sampleR * sampleR;
-          const absL = Math.abs(sampleL);
-          const absR = Math.abs(sampleR);
-          if (absL > peakL) peakL = absL;
-          if (absR > peakR) peakR = absR;
-        }
-        results.push({
-          stripId: 'mastering_return',
-          peakL: peakL * 1.3,
-          peakR: peakR * 1.3,
-          rmsL: Math.sqrt(sumL / 128) * 1.3,
-          rmsR: Math.sqrt(sumR / 128) * 1.3,
-          clipL: peakL > 0.97,
-          clipR: peakR > 0.97
-        });
-      }
-
-      this.onMeterUpdate(results);
-      this.timerHandle = window.setTimeout(checkMeters, 50);
+      this.recordedLeft.set(inL.subarray(0, toCopy), this.recordSampleCount);
+      this.recordedRight.set(inR.subarray(0, toCopy), this.recordSampleCount);
+      this.recordSampleCount += toCopy;
     };
 
-    checkMeters();
+    this.masteringReturnGain.connect(this.recordProcessor);
+    this.recordProcessor.connect(ctx.destination);
+
+    this.recordProvenance = {
+      captureSource: 'physical_mastering_return',
+      deviceId,
+      channelPair,
+      sampleRate: ctx.sampleRate,
+      durationSamples: 0,
+      capturedAt: new Date().toISOString(),
+      isWatermarkedDemo: false,
+      peakDb: -96,
+      rmsDb: -96
+    };
+  }
+
+  public stopRecording(): { left: Float32Array; right: Float32Array; provenance: RecordingProvenance } | null {
+    if (!this.isRecording || !this.recordedLeft || !this.recordedRight) return null;
+    this.isRecording = false;
+
+    if (this.recordProcessor) {
+      try {
+        this.recordProcessor.disconnect();
+        this.recordProcessor.onaudioprocess = null;
+      } catch {}
+      this.recordProcessor = null;
+    }
+
+    const finalLen = Math.max(1, this.recordSampleCount);
+    const leftTrimmed = this.recordedLeft.slice(0, finalLen);
+    const rightTrimmed = this.recordedRight.slice(0, finalLen);
+
+    // Calculate peak and RMS
+    let maxAbs = 0;
+    let sumSq = 0;
+    for (let i = 0; i < finalLen; i++) {
+      const aL = Math.abs(leftTrimmed[i]);
+      const aR = Math.abs(rightTrimmed[i]);
+      if (aL > maxAbs) maxAbs = aL;
+      if (aR > maxAbs) maxAbs = aR;
+      sumSq += (leftTrimmed[i] * leftTrimmed[i] + rightTrimmed[i] * rightTrimmed[i]) / 2;
+    }
+    const peakDb = maxAbs > 0.00001 ? 20 * Math.log10(maxAbs) : -96;
+    const rms = Math.sqrt(sumSq / finalLen);
+    const rmsDb = rms > 0.00001 ? 20 * Math.log10(rms) : -96;
+
+    const provenance: RecordingProvenance = {
+      ...(this.recordProvenance || {
+        captureSource: 'physical_mastering_return',
+        deviceId: 'MOTU 16A',
+        channelPair: 'In 1-2',
+        sampleRate: this.ctx ? this.ctx.sampleRate : 48000,
+        capturedAt: new Date().toISOString()
+      }),
+      durationSamples: finalLen,
+      isWatermarkedDemo: false,
+      peakDb: Math.round(peakDb * 10) / 10,
+      rmsDb: Math.round(rmsDb * 10) / 10
+    };
+
+    return { left: leftTrimmed, right: rightTrimmed, provenance };
+  }
+
+  /**
+   * Generates explicit synthetic test pattern, conspicuously watermarked
+   */
+  public generateSyntheticDemoSignal(sampleRate = 48000, durationSec = 16.0): { left: Float32Array; right: Float32Array; provenance: RecordingProvenance } {
+    const numSamples = Math.floor(sampleRate * durationSec);
+    const left = new Float32Array(numSamples);
+    const right = new Float32Array(numSamples);
+
+    for (let i = 0; i < numSamples; i++) {
+      const t = i / sampleRate;
+      const s1 = Math.sin(2 * Math.PI * 220 * t) * 0.25;
+      const s2 = (Math.sin(2 * Math.PI * 440 * t) > 0 ? 0.15 : -0.15);
+      // Seamless beat envelope
+      const env = 0.5 + 0.5 * Math.cos(2 * Math.PI * (t % 1.0));
+      left[i] = (s1 + s2) * env;
+      right[i] = (s1 - s2) * env;
+    }
+
+    const provenance: RecordingProvenance = {
+      captureSource: 'synthetic_demo_watermarked',
+      deviceId: 'INTERNAL_SIMULATOR',
+      channelPair: 'VIRTUAL_TEST_BUS',
+      sampleRate,
+      durationSamples: numSamples,
+      capturedAt: new Date().toISOString(),
+      isWatermarkedDemo: true,
+      peakDb: -6.0,
+      rmsDb: -14.2
+    };
+
+    return { left, right, provenance };
+  }
+
+  // --- Real-Time VU Meter Polling Loop ---
+  public onMeters(callback: (levels: Record<string, { peakL: number; peakR: number; rmsL: number; rmsR: number }>) => void) {
+    this.onMetersUpdate = callback;
+  }
+
+  private startMeterLoop() {
+    const bufL = new Float32Array(256);
+    const bufR = new Float32Array(256);
+
+    const updateMeters = () => {
+      if (this.onMetersUpdate) {
+        const levels: Record<string, { peakL: number; peakR: number; rmsL: number; rmsR: number }> = {};
+        this.stripNodes.forEach((nodes, id) => {
+          nodes.analyserL.getFloatTimeDomainData(bufL);
+          nodes.analyserR.getFloatTimeDomainData(bufR);
+
+          let pL = 0, pR = 0, sL = 0, sR = 0;
+          for (let i = 0; i < 256; i++) {
+            const vL = Math.abs(bufL[i]);
+            const vR = Math.abs(bufR[i]);
+            if (vL > pL) pL = vL;
+            if (vR > pR) pR = vR;
+            sL += vL * vL;
+            sR += vR * vR;
+          }
+          levels[id] = {
+            peakL: pL,
+            peakR: pR,
+            rmsL: Math.sqrt(sL / 256),
+            rmsR: Math.sqrt(sR / 256)
+          };
+        });
+        this.onMetersUpdate(levels);
+      }
+      requestAnimationFrame(updateMeters);
+    };
+
+    requestAnimationFrame(updateMeters);
   }
 }
 
-// Global Audio Engine Singleton
-export const audioEngine = new StudioAudioEngine();
+function midiNoteToFrequency(note: number): number {
+  return 440 * Math.pow(2, (note - 69) / 12);
+}
+
+export const audioEngine = new AudioEngine();

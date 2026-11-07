@@ -88,23 +88,23 @@ export interface MidinesState {
   dpcm: MidinesDpcmParams;
 }
 
-// MIDIbox SID Parameters
+// MIDIbox SID Parameters & Engine Schemas (V2 Discriminated Unions)
 export type SidChipModel = '6581' | '8580' | '6582';
 export type SidEngineType = 'lead' | 'bassline' | 'multi' | 'drum';
 
 export interface SidOscillatorParams {
   waveform: 'saw' | 'pulse' | 'triangle' | 'noise' | 'combined';
-  pulseWidth: number; // 0-4095 (or 0-127 scaled)
+  pulseWidth: number; // 0-4095 (12-bit SID register)
   octave: number; // -3 to +3
   semitone: number; // -12 to +12
   finetune: number; // -64 to +63
   sync: boolean;
   ringMod: boolean;
-  portamentoRate: number;
+  portamentoRate: number; // 0-127
 }
 
 export interface SidFilterParams {
-  cutoff: number; // 0-2047 (0-127 MIDI scaled)
+  cutoff: number; // 0-2047 (11-bit SID register)
   resonance: number; // 0-15
   lowPass: boolean;
   bandPass: boolean;
@@ -113,6 +113,7 @@ export interface SidFilterParams {
   voice2Filter: boolean;
   voice3Filter: boolean;
   mode303: boolean;
+  externalIn: boolean;
 }
 
 export interface SidEnvelopeParams {
@@ -120,30 +121,202 @@ export interface SidEnvelopeParams {
   decay: number; // 0-15
   sustain: number; // 0-15
   release: number; // 0-15
+  curve?: number; // 0-127 optional extended envelope contour
 }
 
-export interface SidCorePatch {
+export interface SidLfoParams {
+  waveform: 'sine' | 'tri' | 'saw' | 'pulse' | 'rand';
+  rate: number; // 0-127
+  depth: number; // 0-127
+  sync: boolean;
+  phase: number; // 0-360
+}
+
+export interface SidModMatrixRow {
+  id: number; // 1-8
+  source1: 'LFO1' | 'LFO2' | 'LFO3' | 'LFO4' | 'LFO5' | 'LFO6' | 'ENV1' | 'ENV2' | 'WT1' | 'WT2' | 'VEL' | 'MOD' | 'PB' | 'NONE';
+  source2: 'LFO1' | 'LFO2' | 'LFO3' | 'LFO4' | 'LFO5' | 'LFO6' | 'ENV1' | 'ENV2' | 'WT1' | 'WT2' | 'VEL' | 'MOD' | 'PB' | 'NONE';
+  operator: 'NOP' | 'ADD' | 'SUB' | 'MUL' | 'XOR' | 'MIN' | 'MAX';
+  depth: number; // -128 to +127
+  invertLeft: boolean;
+  invertRight: boolean;
+  targetLeft: 'PITCH_ALL' | 'PITCH_OSC1' | 'PW_ALL' | 'CUTOFF' | 'RESONANCE' | 'VOLUME' | 'PAN' | 'NONE';
+  targetRight: 'PITCH_ALL' | 'PITCH_OSC1' | 'PW_ALL' | 'CUTOFF' | 'RESONANCE' | 'VOLUME' | 'PAN' | 'NONE';
+}
+
+export interface SidWavetableParams {
+  id: number; // 1-4
+  stepCount: number; // 1-16
+  speed: number; // 0-127
+  loopMode: 'off' | 'forward' | 'pingpong';
+  steps: number[]; // 16 values (0-127 or signed pitch)
+}
+
+// 1. Lead Engine Patch (6 Oscillators across 2 sockets, 6 LFOs, 2 ENVs, 8-path mod matrix, 4 wavetables)
+export interface LeadPatch {
   coreId: 'sid.core1' | 'sid.core2' | 'sid.core3' | 'sid.core4';
   name: string;
-  engine: SidEngineType;
+  engine: 'lead';
   socketLeftModel: SidChipModel;
   socketRightModel: SidChipModel;
   stereoSpread: number; // 0-100%
+  syncStatus: 'synced' | 'pending' | 'unverified' | 'offline';
+  // Left SID Chip Oscillators
   osc1: SidOscillatorParams;
   osc2: SidOscillatorParams;
   osc3: SidOscillatorParams;
+  // Right SID Chip Oscillators
+  osc4: SidOscillatorParams;
+  osc5: SidOscillatorParams;
+  osc6: SidOscillatorParams;
   filter: SidFilterParams;
-  filterEnv: SidEnvelopeParams;
+  filterRight?: SidFilterParams;
   ampEnv: SidEnvelopeParams;
-  lfo1Rate: number;
-  lfo1Depth: number;
-  lfo1Target: 'pitch' | 'pulseWidth' | 'filterCutoff';
-  lfo2Rate: number;
-  lfo2Depth: number;
-  lfo2Target: 'pitch' | 'pulseWidth' | 'filterCutoff';
+  filterEnv: SidEnvelopeParams;
+  // 6 LFOs
+  lfos: [SidLfoParams, SidLfoParams, SidLfoParams, SidLfoParams, SidLfoParams, SidLfoParams];
+  // 2 Extended Envelopes
+  envs: [SidEnvelopeParams, SidEnvelopeParams];
+  // 8-Path Modulation Matrix
+  modMatrix: SidModMatrixRow[];
+  // 4 Wavetables
+  wavetables: [SidWavetableParams, SidWavetableParams, SidWavetableParams, SidWavetableParams];
   arpEnabled: boolean;
   arpRate: '1/16' | '1/32' | '1/8';
   arpRange: number;
+  rawSysExDump?: number[];
+  rawOpaqueBytes?: number[];
+}
+
+// 2. Bassline Engine Patch (TB-303 Architecture with 2 independent basslines Left/Right)
+export interface BasslineInstrument {
+  waveform: 'saw' | 'pulse';
+  pulseWidth: number; // 0-4095
+  cutoff: number; // 0-2047
+  resonance: number; // 0-15
+  envModDepth: number; // 0-127
+  decay: number; // 0-127
+  accentDepth: number; // 0-127
+  glideRate: number; // 0-127
+  octave: number;
+  steps: Array<{
+    note: number; // 0-11
+    octave: number; // -2 to +2
+    gate: boolean;
+    slide: boolean;
+    accent: boolean;
+  }>; // 16 steps
+}
+
+export interface BasslinePatch {
+  coreId: 'sid.core1' | 'sid.core2' | 'sid.core3' | 'sid.core4';
+  name: string;
+  engine: 'bassline';
+  socketLeftModel: SidChipModel;
+  socketRightModel: SidChipModel;
+  stereoSpread: number;
+  syncStatus: 'synced' | 'pending' | 'unverified' | 'offline';
+  inst1: BasslineInstrument; // Left SID
+  inst2: BasslineInstrument; // Right SID
+  sequencerMode: 'internal_sequencer' | 'external_midi';
+  clockSync: 'internal' | 'midi_clock';
+  swing: number; // 0-100%
+  rawSysExDump?: number[];
+  rawOpaqueBytes?: number[];
+}
+
+// 3. Multi Engine Patch (Up to 6 independent instruments inside the core)
+export interface MultiInstrument {
+  id: number; // 1-6
+  name: string;
+  midiChannel: number; // 1-16
+  keyRangeLow: number; // 0-127
+  keyRangeHigh: number; // 0-127
+  polyphony: 'mono' | 'poly';
+  voiceAllocation: number; // 1-6 SID voices
+  waveform: 'saw' | 'pulse' | 'triangle' | 'noise';
+  octave: number;
+  pulseWidth: number;
+  env: SidEnvelopeParams;
+  lfoRate: number;
+  lfoDepth: number;
+  filterRouting: boolean;
+}
+
+export interface MultiPatch {
+  coreId: 'sid.core1' | 'sid.core2' | 'sid.core3' | 'sid.core4';
+  name: string;
+  engine: 'multi';
+  socketLeftModel: SidChipModel;
+  socketRightModel: SidChipModel;
+  stereoSpread: number;
+  syncStatus: 'synced' | 'pending' | 'unverified' | 'offline';
+  instruments: MultiInstrument[];
+  filter: SidFilterParams;
+  rawSysExDump?: number[];
+  rawOpaqueBytes?: number[];
+}
+
+// 4. Drum Engine Patch (16-voice SID Drum Synthesizer)
+export interface DrumInstrument {
+  id: number; // 1-16
+  name: string;
+  triggerNote: number; // MIDI note 35-81
+  voiceType: 'analog_kick' | 'analog_snare' | 'noise_hat' | 'tom' | 'zap' | 'metallic';
+  decay: number; // 0-127
+  pitch: number; // 0-127
+  sweepRate: number; // 0-127
+  filterCutoff: number; // 0-2047
+  filterResonance: number; // 0-15
+  accent: number; // 0-127
+  steps: boolean[]; // 16 steps
+}
+
+export interface DrumPatch {
+  coreId: 'sid.core1' | 'sid.core2' | 'sid.core3' | 'sid.core4';
+  name: string;
+  engine: 'drum';
+  socketLeftModel: SidChipModel;
+  socketRightModel: SidChipModel;
+  stereoSpread: number;
+  syncStatus: 'synced' | 'pending' | 'unverified' | 'offline';
+  drums: DrumInstrument[];
+  clockMultiplier: '1x' | '2x' | '0.5x';
+  rawSysExDump?: number[];
+  rawOpaqueBytes?: number[];
+}
+
+// Discriminated Union for all MIDIbox SID Core Patches
+export type SidCorePatch = LeadPatch | BasslinePatch | MultiPatch | DrumPatch;
+
+// Web MIDI and Hardware Device Types
+export interface MidiPortInfo {
+  id: string;
+  name: string;
+  manufacturer?: string;
+  state: 'connected' | 'disconnected';
+  type: 'input' | 'output';
+}
+
+export interface HardwareBindingConfig {
+  mode: 'simulator' | 'hardware';
+  midinesPortId: string | null;
+  midinesChannel: number; // default 1
+  sidCorePorts: [string | null, string | null, string | null, string | null];
+  sidCoreChannels: [number, number, number, number]; // default 6, 7, 8, 9
+  syncClockOutput: boolean;
+}
+
+export interface RecordingProvenance {
+  captureSource: 'physical_mastering_return' | 'synthetic_demo_watermarked';
+  deviceId: string;
+  channelPair: string;
+  sampleRate: number;
+  durationSamples: number;
+  capturedAt: string;
+  isWatermarkedDemo: boolean;
+  peakDb: number;
+  rmsDb: number;
 }
 
 // ASIO and Physical Routing Matrix
@@ -263,6 +436,8 @@ export interface MidiParsedEvent {
 export interface MidiParsedTrack {
   index: number;
   name: string;
+  isConductor: boolean;
+  noteCount: number;
   eventCount: number;
   channelMask: number[];
   noteRange: { min: number; max: number };
@@ -298,6 +473,10 @@ export interface ProjectSession {
   createdAt: string;
   updatedAt: string;
   midiFileName: string;
+  midiFileBase64?: string; // Stored raw SMF binary bytes to prevent silent fabrication of demo content
+  midiHash?: string;
+  recordingProvenance?: RecordingProvenance | null;
+  hardwareBinding?: HardwareBindingConfig;
   routes: MidiRoute[];
   midinesState: MidinesState;
   sidPatches: [SidCorePatch, SidCorePatch, SidCorePatch, SidCorePatch];
@@ -309,5 +488,6 @@ export interface ProjectSession {
     midiOffsetMs: number;
     fxLoopRoundtripMs: number;
     masterRoundtripMs: number;
+    isLoopbackVerified: boolean;
   };
 }

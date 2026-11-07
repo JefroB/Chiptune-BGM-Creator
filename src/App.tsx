@@ -29,8 +29,11 @@ import {
 } from './types/index.ts';
 
 import { createChiptuneDemoSmf } from './data/demoSongs.ts';
+import { DEFAULT_SID_PATCHES } from './data/defaultSidPatches.ts';
 import { MidiParser } from './services/midiParser.ts';
-import { audioEngine, MeterData } from './services/audioEngine.ts';
+import { audioEngine } from './services/audioEngine.ts';
+import { createRoutesForSong } from './services/midiRouting.ts';
+
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<string>('dashboard');
@@ -49,15 +52,15 @@ export default function App() {
 
   // 1. Midi Routes (8 Primary Tracks + 1 DPCM Aux Lane)
   const [routes, setRoutes] = useState<MidiRoute[]>([
-    { trackIndex: 0, trackName: 'Track 1 - NES Pulse 1 (Lead Arp)', voiceId: 'nes.pulse1', outputPortId: 'port_a', midiChannel: 1, muted: false, soloed: false },
-    { trackIndex: 1, trackName: 'Track 2 - NES Pulse 2 (Counter Melody)', voiceId: 'nes.pulse2', outputPortId: 'port_a', midiChannel: 2, muted: false, soloed: false },
-    { trackIndex: 2, trackName: 'Track 3 - NES Triangle (Walking Bass)', voiceId: 'nes.triangle', outputPortId: 'port_a', midiChannel: 3, muted: false, soloed: false },
-    { trackIndex: 3, trackName: 'Track 4 - NES Noise (Percussion / Hats)', voiceId: 'nes.noise', outputPortId: 'port_a', midiChannel: 4, muted: false, soloed: false },
-    { trackIndex: 4, trackName: 'Track 5 - SID Core 1 (Heavy 6581 Bass)', voiceId: 'sid.core1', outputPortId: 'port_b', midiChannel: 6, muted: false, soloed: false },
-    { trackIndex: 5, trackName: 'Track 6 - SID Core 2 (Stereo PWM Arp)', voiceId: 'sid.core2', outputPortId: 'port_b', midiChannel: 7, muted: false, soloed: false },
-    { trackIndex: 6, trackName: 'Track 7 - SID Core 3 (Poly Synth Brass)', voiceId: 'sid.core3', outputPortId: 'port_b', midiChannel: 8, muted: false, soloed: false },
-    { trackIndex: 7, trackName: 'Track 8 - SID Core 4 (Ambient Noise Pad)', voiceId: 'sid.core4', outputPortId: 'port_b', midiChannel: 9, muted: false, soloed: false },
-    { trackIndex: 8, trackName: 'Track 9 - NES DPCM Aux (256 Drum Kit)', voiceId: 'nes.dpcm', outputPortId: 'port_a', midiChannel: 5, muted: false, soloed: false }
+    { trackIndex: 1, trackName: 'Track 1 - NES Pulse 1 (Lead Arp)', voiceId: 'nes.pulse1', outputPortId: 'port_a', midiChannel: 1, muted: false, soloed: false },
+    { trackIndex: 2, trackName: 'Track 2 - NES Pulse 2 (Counter Melody)', voiceId: 'nes.pulse2', outputPortId: 'port_a', midiChannel: 2, muted: false, soloed: false },
+    { trackIndex: 3, trackName: 'Track 3 - NES Triangle (Walking Bass)', voiceId: 'nes.triangle', outputPortId: 'port_a', midiChannel: 3, muted: false, soloed: false },
+    { trackIndex: 4, trackName: 'Track 4 - NES Noise (Percussion / Hats)', voiceId: 'nes.noise', outputPortId: 'port_a', midiChannel: 4, muted: false, soloed: false },
+    { trackIndex: 5, trackName: 'Track 5 - SID Core 1 (Heavy 6581 Bass)', voiceId: 'sid.core1', outputPortId: 'port_b', midiChannel: 6, muted: false, soloed: false },
+    { trackIndex: 6, trackName: 'Track 6 - SID Core 2 (Stereo PWM Arp)', voiceId: 'sid.core2', outputPortId: 'port_b', midiChannel: 7, muted: false, soloed: false },
+    { trackIndex: 7, trackName: 'Track 7 - SID Core 3 (Poly Synth Brass)', voiceId: 'sid.core3', outputPortId: 'port_b', midiChannel: 8, muted: false, soloed: false },
+    { trackIndex: 8, trackName: 'Track 8 - SID Core 4 (Ambient Noise Pad)', voiceId: 'sid.core4', outputPortId: 'port_b', midiChannel: 9, muted: false, soloed: false },
+    { trackIndex: 9, trackName: 'Track 9 - NES DPCM Aux (256 Drum Kit)', voiceId: 'nes.dpcm', outputPortId: 'port_a', midiChannel: 5, muted: false, soloed: false }
   ]);
 
   // 2. MIDInes State
@@ -69,101 +72,8 @@ export default function App() {
     dpcm: { activeBank: 1, sampleRate: 15, loop: false, volume: 15 }
   });
 
-  // 3. MIDIbox SID Patches (4 Stereo Cores)
-  const [sidPatches, setSidPatches] = useState<[SidCorePatch, SidCorePatch, SidCorePatch, SidCorePatch]>([
-    {
-      coreId: 'sid.core1',
-      name: 'Core 1: 6581 Heavy Bassline (Pair 1)',
-      engine: 'bassline',
-      socketLeftModel: '6581',
-      socketRightModel: '6581',
-      stereoSpread: 25,
-      osc1: { waveform: 'saw', pulseWidth: 2048, octave: -1, semitone: 0, finetune: 0, sync: false, ringMod: false, portamentoRate: 0 },
-      osc2: { waveform: 'pulse', pulseWidth: 1024, octave: -1, semitone: 7, finetune: 5, sync: false, ringMod: false, portamentoRate: 0 },
-      osc3: { waveform: 'saw', pulseWidth: 2048, octave: 0, semitone: 0, finetune: -5, sync: false, ringMod: false, portamentoRate: 0 },
-      filter: { cutoff: 1400, resonance: 9, lowPass: true, bandPass: false, highPass: false, voice1Filter: true, voice2Filter: true, voice3Filter: true, mode303: true },
-      filterEnv: { attack: 1, decay: 6, sustain: 2, release: 3 },
-      ampEnv: { attack: 0, decay: 4, sustain: 10, release: 4 },
-      lfo1Rate: 35,
-      lfo1Depth: 20,
-      lfo1Target: 'filterCutoff',
-      lfo2Rate: 15,
-      lfo2Depth: 10,
-      lfo2Target: 'pulseWidth',
-      arpEnabled: false,
-      arpRate: '1/16',
-      arpRange: 1
-    },
-    {
-      coreId: 'sid.core2',
-      name: 'Core 2: 8580 Stereo PWM Lead (Pair 2)',
-      engine: 'lead',
-      socketLeftModel: '8580',
-      socketRightModel: '8580',
-      stereoSpread: 65,
-      osc1: { waveform: 'pulse', pulseWidth: 1500, octave: 0, semitone: 0, finetune: 0, sync: false, ringMod: false, portamentoRate: 0 },
-      osc2: { waveform: 'pulse', pulseWidth: 2500, octave: 0, semitone: 0, finetune: 8, sync: false, ringMod: false, portamentoRate: 0 },
-      osc3: { waveform: 'triangle', pulseWidth: 2048, octave: -1, semitone: 0, finetune: 0, sync: false, ringMod: false, portamentoRate: 0 },
-      filter: { cutoff: 1850, resonance: 12, lowPass: true, bandPass: true, highPass: false, voice1Filter: true, voice2Filter: true, voice3Filter: false, mode303: false },
-      filterEnv: { attack: 2, decay: 8, sustain: 6, release: 5 },
-      ampEnv: { attack: 1, decay: 5, sustain: 12, release: 5 },
-      lfo1Rate: 48,
-      lfo1Depth: 60,
-      lfo1Target: 'pulseWidth',
-      lfo2Rate: 20,
-      lfo2Depth: 15,
-      lfo2Target: 'pitch',
-      arpEnabled: false,
-      arpRate: '1/16',
-      arpRange: 2
-    },
-    {
-      coreId: 'sid.core3',
-      name: 'Core 3: Mixed 6581/8580 Poly Brass (Pair 3)',
-      engine: 'multi',
-      socketLeftModel: '6581',
-      socketRightModel: '8580',
-      stereoSpread: 50,
-      osc1: { waveform: 'saw', pulseWidth: 2048, octave: 0, semitone: 0, finetune: 0, sync: false, ringMod: false, portamentoRate: 0 },
-      osc2: { waveform: 'saw', pulseWidth: 2048, octave: 0, semitone: 4, finetune: 4, sync: false, ringMod: false, portamentoRate: 0 },
-      osc3: { waveform: 'saw', pulseWidth: 2048, octave: 0, semitone: 7, finetune: -4, sync: false, ringMod: false, portamentoRate: 0 },
-      filter: { cutoff: 1600, resonance: 6, lowPass: true, bandPass: false, highPass: false, voice1Filter: true, voice2Filter: true, voice3Filter: true, mode303: false },
-      filterEnv: { attack: 4, decay: 7, sustain: 8, release: 6 },
-      ampEnv: { attack: 3, decay: 6, sustain: 11, release: 6 },
-      lfo1Rate: 20,
-      lfo1Depth: 10,
-      lfo1Target: 'pitch',
-      lfo2Rate: 10,
-      lfo2Depth: 5,
-      lfo2Target: 'filterCutoff',
-      arpEnabled: false,
-      arpRate: '1/16',
-      arpRange: 1
-    },
-    {
-      coreId: 'sid.core4',
-      name: 'Core 4: 8580 Ambient Space Pad (Pair 4)',
-      engine: 'lead',
-      socketLeftModel: '8580',
-      socketRightModel: '8580',
-      stereoSpread: 80,
-      osc1: { waveform: 'triangle', pulseWidth: 2048, octave: 1, semitone: 0, finetune: 0, sync: false, ringMod: false, portamentoRate: 0 },
-      osc2: { waveform: 'saw', pulseWidth: 2048, octave: 1, semitone: 7, finetune: 6, sync: false, ringMod: false, portamentoRate: 0 },
-      osc3: { waveform: 'noise', pulseWidth: 2048, octave: 0, semitone: 0, finetune: 0, sync: false, ringMod: false, portamentoRate: 0 },
-      filter: { cutoff: 1200, resonance: 8, lowPass: false, bandPass: true, highPass: false, voice1Filter: true, voice2Filter: true, voice3Filter: true, mode303: false },
-      filterEnv: { attack: 7, decay: 9, sustain: 10, release: 9 },
-      ampEnv: { attack: 6, decay: 8, sustain: 12, release: 9 },
-      lfo1Rate: 12,
-      lfo1Depth: 35,
-      lfo1Target: 'filterCutoff',
-      lfo2Rate: 8,
-      lfo2Depth: 20,
-      lfo2Target: 'pitch',
-      arpEnabled: false,
-      arpRate: '1/16',
-      arpRange: 1
-    }
-  ]);
+  // 3. MIDIbox SID Patches (4 Stereo Cores with Full V2 Engine Models)
+  const [sidPatches, setSidPatches] = useState<[SidCorePatch, SidCorePatch, SidCorePatch, SidCorePatch]>(DEFAULT_SID_PATCHES);
 
   // 4. Physical Routing Configuration
   const [routing, setRouting] = useState<RoutingConfig>({
@@ -236,18 +146,20 @@ export default function App() {
   useEffect(() => {
     loadDemoSong();
 
-    // Wire up audio progress callback
-    audioEngine.setOnPlaybackProgress((sec, total, tick) => {
-      setCurrentTimeSec(sec);
-      setTotalTimeSec(total);
-      setCurrentTick(tick);
-    });
-
     // Wire up live meter updates
-    audioEngine.setOnMeterUpdate((meterList: MeterData[]) => {
+    audioEngine.onMeters((levels) => {
       setMixerStrips((prev) =>
         prev.map((strip) => {
-          const match = meterList.find((m) => m.stripId === strip.id);
+          let key = strip.id;
+          if (strip.sourceType === 'nes_mono') key = 'nes_mono';
+          else if (strip.id.includes('sid1') || strip.id.includes('core1')) key = 'sid_core1';
+          else if (strip.id.includes('sid2') || strip.id.includes('core2')) key = 'sid_core2';
+          else if (strip.id.includes('sid3') || strip.id.includes('core3')) key = 'sid_core3';
+          else if (strip.id.includes('sid4') || strip.id.includes('core4')) key = 'sid_core4';
+          else if (strip.id.includes('fx_a')) key = 'fx_return_a';
+          else if (strip.id.includes('fx_b')) key = 'fx_return_b';
+
+          const match = levels[key];
           if (match) {
             return {
               ...strip,
@@ -255,8 +167,8 @@ export default function App() {
               meterPeakR: match.peakR,
               meterRmsL: match.rmsL,
               meterRmsR: match.rmsR,
-              clipL: match.clipL,
-              clipR: match.clipR
+              clipL: match.peakL >= 1.0,
+              clipR: match.peakR >= 1.0
             };
           }
           return strip;
@@ -272,6 +184,7 @@ export default function App() {
       const parsed = parser.parse();
       setSongModel(parsed);
       setTotalTimeSec(parsed.durationSec);
+      setRoutes(createRoutesForSong(parsed));
       showNotification('Loaded 8-Track + DPCM Chiptune Demo Arrangement');
     } catch (e) {
       console.error('Failed to load demo song', e);
@@ -288,7 +201,19 @@ export default function App() {
     if (!songModel) return;
     setIsPlaying(true);
     setIsPaused(false);
-    audioEngine.playSong(songModel, isPaused ? currentTimeSec : 0);
+    audioEngine.playSong(
+      songModel,
+      routes,
+      isPaused ? currentTimeSec : 0,
+      (sec) => {
+        setCurrentTimeSec(sec);
+        setCurrentTick(Math.floor(sec * (songModel.ppq * 2)));
+      },
+      () => {
+        setIsPlaying(false);
+        setIsPaused(false);
+      }
+    );
   };
 
   const handlePause = () => {
@@ -308,7 +233,19 @@ export default function App() {
     setCurrentTimeSec(0);
     setCurrentTick(0);
     if (isPlaying && songModel) {
-      audioEngine.playSong(songModel, 0);
+      audioEngine.playSong(
+        songModel,
+        routes,
+        0,
+        (sec) => {
+          setCurrentTimeSec(sec);
+          setCurrentTick(Math.floor(sec * (songModel.ppq * 2)));
+        },
+        () => {
+          setIsPlaying(false);
+          setIsPaused(false);
+        }
+      );
     }
   };
 
@@ -399,10 +336,10 @@ export default function App() {
   };
 
   // SID Patch updates
-  const handleUpdateSidPatch = (coreIndex: number, partial: Partial<SidCorePatch>) => {
+  const handleUpdateSidPatch = (coreIndex: number, patch: SidCorePatch) => {
     setSidPatches((prev) => {
       const updated = [...prev] as typeof prev;
-      updated[coreIndex] = { ...updated[coreIndex], ...partial };
+      updated[coreIndex] = patch;
       return updated;
     });
   };
@@ -460,7 +397,8 @@ export default function App() {
             onSongLoaded={(parsed, name) => {
               setSongModel(parsed);
               setTotalTimeSec(parsed.durationSec);
-              showNotification(`Imported MIDI: ${name}`);
+              setRoutes(createRoutesForSong(parsed));
+              showNotification(`Imported MIDI: ${name} (${parsed.tracks.length} tracks, format ${parsed.format})`);
             }}
             onUpdateRoute={handleUpdateRoute}
             onLoadDemo={loadDemoSong}

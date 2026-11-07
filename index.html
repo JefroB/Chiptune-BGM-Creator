@@ -9,6 +9,76 @@
     <meta property="og:description" content="Professional chiptune hardware workstation for MIDInes and MIDIbox SID orchestration, multichannel ASIO mixing, hardware FX loops, mastering return capture, and RPG Maker MV OGG BGM export." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
+    <script>
+      // AI Studio Environment: HMR is disabled in preview iframe.
+      // Gracefully stub Vite HMR WebSocket connections to avoid net::ERR_CONNECTION_REFUSED
+      (function() {
+        if (typeof window === 'undefined') return;
+        const NativeWebSocket = window.WebSocket;
+        if (!NativeWebSocket) return;
+
+        window.WebSocket = function(url, protocols) {
+          const urlStr = String(url || '');
+          const protoStr = String(protocols || '');
+          if (
+            urlStr.includes('vite-hmr') ||
+            protoStr.includes('vite-hmr') ||
+            urlStr.includes(':24678')
+          ) {
+            // Simulated open socket for Vite HMR client
+            const listeners = {};
+            const fakeSocket = {
+              readyState: 1, // OPEN
+              OPEN: 1,
+              CONNECTING: 0,
+              CLOSING: 2,
+              CLOSED: 3,
+              send: function() {},
+              close: function() {},
+              addEventListener: function(event, handler) {
+                listeners[event] = listeners[event] || [];
+                listeners[event].push(handler);
+                if (event === 'open') {
+                  setTimeout(handler, 0);
+                }
+              },
+              removeEventListener: function(event, handler) {
+                if (listeners[event]) {
+                  listeners[event] = listeners[event].filter(h => h !== handler);
+                }
+              },
+              dispatchEvent: function() { return true; }
+            };
+            return fakeSocket;
+          }
+          return new NativeWebSocket(url, protocols);
+        };
+        window.WebSocket.prototype = NativeWebSocket.prototype;
+        window.WebSocket.CONNECTING = NativeWebSocket.CONNECTING;
+        window.WebSocket.OPEN = NativeWebSocket.OPEN;
+        window.WebSocket.CLOSING = NativeWebSocket.CLOSING;
+        window.WebSocket.CLOSED = NativeWebSocket.CLOSED;
+
+        window.addEventListener('unhandledrejection', function(event) {
+          if (
+            event.reason &&
+            (String(event.reason.message || '').includes('WebSocket') ||
+             String(event.reason.stack || '').includes('@vite/client') ||
+             String(event.reason.stack || '').includes('createWebSocketModuleRunnerTransport'))
+          ) {
+            event.preventDefault();
+          }
+        });
+        window.addEventListener('error', function(event) {
+          if (
+            String(event.message || '').includes('WebSocket') ||
+            String(event.filename || '').includes('@vite/client')
+          ) {
+            event.preventDefault();
+          }
+        });
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

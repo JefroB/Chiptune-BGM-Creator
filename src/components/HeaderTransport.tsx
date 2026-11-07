@@ -108,13 +108,13 @@ export const HeaderTransport: React.FC<HeaderTransportProps> = ({
             onClick={() => setIsSimulatorMode(!isSimulatorMode)}
             className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-[11px] font-mono font-medium border transition-all ${
               isSimulatorMode
-                ? 'bg-amber-950/60 text-amber-300 border-amber-600 shadow-[0_0_10px_rgba(245,158,11,0.2)]'
-                : 'bg-emerald-950/60 text-emerald-300 border-emerald-600 shadow-[0_0_10px_rgba(16,185,129,0.2)]'
+                ? 'bg-amber-950/80 text-amber-300 border-amber-600 shadow-[0_0_10px_rgba(245,158,11,0.2)]'
+                : 'bg-emerald-950/80 text-emerald-300 border-emerald-600 shadow-[0_0_10px_rgba(16,185,129,0.2)]'
             }`}
             title="Toggle between Physical ASIO Hardware Setup and Live WebAudio Synth Simulator"
           >
             {isSimulatorMode ? <Cpu className="w-3.5 h-3.5 text-amber-400" /> : <Radio className="w-3.5 h-3.5 text-emerald-400" />}
-            <span>{isSimulatorMode ? 'MODE: STUDIO SIMULATOR (LIVE SYNTH)' : 'MODE: PHYSICAL ASIO / MIDI'}</span>
+            <span>{isSimulatorMode ? 'MODE: SIMULATOR / NO HARDWARE I/O' : 'MODE: PHYSICAL ASIO & MIDI'}</span>
           </button>
 
           <div className="flex items-center gap-1.5 bg-neutral-900 border border-neutral-700/80 px-2 py-0.5 rounded text-[11px] font-mono text-neutral-300">

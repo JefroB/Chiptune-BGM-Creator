@@ -1,0 +1,154 @@
+Chiptune BGM Creator — Adversarial code review and Gemini remediation brief
+Review date: 2026-11-07
+Repository: https://github.com/JefroB/Chiptune-BGM-Creator
+Target: default main branch, inspected through connected GitHub repository files
+Assessment scope: source inspection (not compiled, executed, or tested against hardware).  
+Executive verdict
+NOT READY FOR HARDWARE USE OR RPG Maker MV EXPORT. The repository is a polished React/Vite browser demonstration with simulated WebAudio synthesizers, effects, mastering, routing and recording. It is not a functional Windows ASIO / MIDIbox SID / MIDInes hardware controller. Two especially dangerous false claims are (1) OGG output as compliant Vorbis when real Vorbis encoding does not happen and (2) a patchbay claiming verified loop isolation and calibration without any actual audio I/O.
+
+The MIDIbox SID editor is not just missing some UI controls: the SidCorePatch schema cannot encode MIDIbox SID V2's actual engine-specific patches. The correct repair starts with a documented device protocol and lossless patch schema, then an editor generated against the schema. Do not fix this by simply adding generic sliders.
+Prioritized findings
+P0-01: MIDIbox SID editing is disconnected from actual MIDI hardware
+- Evidence: src/components/SidEditorView.tsx:15-31, src/App.tsx:401-408: edits only update React state; Audition calls audioEngine.triggerNoteOn. src/services/audioEngine.ts:289-401: synthesizes generic WebAudio tones. No actual Windows MIDI input/output port enumeration, NRPN TX, SysEx transaction, patch dump, or hardware verification service is present.
+- Impact: MIDIbox SID cannot be edited or auditioned on the real 8-SID rig. A visually changing slider can falsely imply device state changed.
+- Fix: Define MidiOutputPort, MidiInputPort, SidProtocolAdapter, SidTransactionQueue, SidPatchLibrarian, DeviceCapabilityProbe; support device-bound vs local-only edit modes and clearly indicate pending/acknowledged/unverified status. Add deterministic wire-level tests and hardware-in-the-loop smoke tests.
+P0-02: SID core patch schema cannot represent the four V2 engines
+- Evidence: src/types/index.ts:91-147: one homogeneous SidCorePatch containing 3 oscillators, one filter, 2 simple LFOs, basic ADSR and arpeggiator. src/components/SidEditorView.tsx:35-366: one common layout regardless of selected engine.
+- Impact: Cannot preserve/load/edit full Lead, Bassline, Multi, or Drum patch data, and changing engine does not change editor capabilities. Saving the view model loses data that a full hardware patch requires.
+- Fix: Use a discriminated union (LeadPatch | BasslinePatch | MultiPatch | DrumPatch) with engine-specific structures and a byte-preserving opaque representation for all unknown firmware fields. Store per-core assigned patch/bank, per-core hardware setup and ensemble separately. Make conversion between SysEx patch and typed model roundtrip byte-for-byte where possible. Document unknown bytes rather than guessing.
+P0-03: “OGG Vorbis export” is not an actual Vorbis encoder
+- Evidence: src/services/audioExport.ts, buildCompliantOggVorbisPages: synthesizes a 64-byte dummy setup header using (i*37)&0xff, and writes quantized interleaved PCM bytes as purported Vorbis audio packets. An Ogg container header does not turn PCM into Vorbis. test/audioExport.test.ts:48-81 checks only OggS, vorbis string and comment text, never decodes audio.
+- Impact: Output is likely invalid/unplayable in RPG Maker MV, undermining the principal product deliverable.
+- Fix: Replace entirely with known working libvorbis encoder or FFmpeg invoked from a Windows native backend; write LOOPSTART/LOOPLENGTH tags in the correct sample domain; decode with independent decoder; compare duration, content, loop points and audio; test directly in RPG Maker MV. No fake success or fallback file generation.
+P0-04: The ASIO routing, external effects and mastering return are simulated, not implemented
+- Evidence: package.json has Vite/React, no Electron main process, native ASIO interface or Win32 MIDI interface. src/services/audioEngine.ts:82-155 uses window.AudioContext, synthetic Delay/Convolver and Waveshaper; graph feeds browser ctx.destination. src/components/PatchbayView.tsx:39-74 populates apparent physical channel choices and simulated calibration messages using timeouts.
+- Impact: No physical MIDInes mono input, four SID stereo inputs, two hardware effects sends/returns, or master return capture. Unsafe trust in mock route status.
+- Fix: Architect native Windows backend (C++/Rust/Node addon with licensed/appropriate ASIO support, or proven sound driver abstraction) exposing enumerated driver channels, buffers, stable input/output channel IDs, physically enforced anti-feedback validation, real loopback calibration, and native master-return capture. Until connected, UI must say SIMULATED / NO HARDWARE I/O prominently.
+P0-05: MIDI playback disregards configured routes and shifts every track in a conventional format-1 MIDI file with conductor
+- Evidence: src/services/audioEngine.ts:465-499 hardcodes voiceMap by raw track index: index 4 maps to DPCM, indices 5-8 SID. src/App.tsx:50-60 declares indices 0-3 MIDInes, 4-7 SID, 8 DPCM; src/data/demoSongs.ts:54-61 adds a conductor track before these, so the file has 10 SMF tracks. audioEngine.playSong does not accept the routes state at all.
+- Impact: Tempo/conductor assigned to a NES voice slot, MIDI instrument notes land on wrong synth, DPCM notes can reach a SID voice. MIDI file imported from Gemini cannot be trusted.
+- Fix: Separate SMF track index from playback logical voice slot. Strip or mark meta-only conductor tracks; map by explicit declared track names/port+channel/profile; use MidiRoute[] as actual scheduling input. Fixed assignment of 4 MIDInes channels + 4 SID cores + optional auxiliary DPCM lane, but never map from raw array ordering without validation. MIDI port namespaces must be independent. Add fixture with conductor + 9 content tracks, plus format-0 by-channel split and tracks in arbitrary order.
+P0-06: MIDI CC, pitch bend, program changes, SysEx and MIDI clock do not reach hardware
+- Evidence: src/services/audioEngine.ts:478-499 handles only noteOn and noteOff with setTimeout. MidiParsedEvent supports other types, but the playback discards them.
+- Impact: DPCM CC14 bank changes ignored, SID patch/automation ignored, and arpeggiators/sequencers cannot synchronize to MIDI clock. Full MIDI files will not sound as composed.
+- Fix: Build a scheduled, ordered MIDI event engine respecting event status, MIDI channel, output port, CC, RPN/NRPN, pitchbend, program change, tempo, clock, start/stop/continue and SysEx policy. Stable same-tick event priority: safe setup/program/bank/parameter first, note-offs then note-ons as device semantics require, with documented exceptions. Never infer hardware settings from rendered UI state.
+P0-07: MIDI transport timing uses UI timers, not clock-disciplined scheduling
+- Evidence: src/services/audioEngine.ts:465-500 schedules a setTimeout for each MIDI event and triggers WebAudio nodes at callback time, not scheduled audio time; pause/stop only guards callbacks. SidEditorView.tsx:27-31 audition also uses setTimeout.
+- Impact: Timer jitter, late events under UI load, inability to guarantee seamless music timing or deterministic recordings.
+- Fix: Native monotonic clock anchored to ASIO stream sample position, rolling lookahead scheduling and bounded event queue. Measure jitter and end-to-end MIDI latency against actual hardware, not setTimeout guesses.
+P0-08: Export can silently substitute synthetic audio for an actual recording
+- Evidence: src/components/MasteringExportView.tsx:52-72, 82-104, 131-149 calls ensureCapturedAudio() which generates a 16-second synthesized master if none has been recorded, and the component calls it on render before user chooses capture. Empty recording falls back to this generated signal.
+- Impact: User may publish fake audio instead of recorded hardware synths.
+- Fix: Remove automatic synthesized fallback in production. Require recording provenance (captureSource=physicalMasterReturn, device ID, channel pair, sample rate, duration, stream status), arm/disarm and input-signal checks. Separate explicit Demo Mode test-data generation with conspicuous watermark/state.
+P1-09: No data model or UI for the real MIDIbox SID Lead engine modulation system
+- Evidence: src/types/index.ts:138-143 has only two LFO scalar fields; SidEditorView.tsx has no mod matrix interface. Official documentation describes 8 modulation paths combining two sources with operators; Lead offers six LFOs, two envelopes, and four wavetables; sources/targets can be linked and left/right independently enabled.
+- Fix: Eight-path visual modulation matrix. Per path: source A, source B, operator, signed depth, left/right inversion, target bitsets per side. Six LFO editors, two enhanced envelope editors, four wavetable editors, source feedback/chaining and validation. Support read/write of actual parameters and snapshot testing.
+P1-10: Bassline editor is absent
+- Evidence: Engine dropdown changes activePatch.engine but UI stays generic (SidEditorView.tsx:60-74, subsequent oscillator/filter/ADSR). Official Bassline engine has two bassline instruments (left/right), sequencer patterns with gate/slide/accent controls and sound parameter lanes, per-instrument LFO/envelope configurations.
+- Fix: Bassline-specific L/R selector, per-instrument synth parameters, two LFOs, envelope, accent/slide behavior, step sequence and pattern editor, swing/clock sync, sequence randomization, MIDI triggering behavior. Clearly separate internal SID sequencer from imported MIDI timeline; display actual firmware-verified limits.
+P1-11: Multi editor / per-instrument allocation absent
+- Evidence: SidCorePatch represents one synth per core and SidEditorView has no Multi instruments or per-voice/channel configuration. Official Multi engine supports up to six instruments across a stereo pair, static voice/filter assignment, each instrument with independent wavetable and LFO/env parameters.
+- Fix: Multi instrument list (up to six where allowed), MIDI channel and key/velocity ranges, poly/mono allocation, chip/voice assignment, static filter masks, per-instrument LFOs, envelopes, wavetables, velocity/pitchbend, ADSR bug workaround/latency warning. Allow multiple musical subparts inside one of the user's four stereo audio pairs, while keeping the original 4-pair physical output model.
+P1-12: Drum editor is absent
+- Evidence: Engine dropdown supports drum but generic oscillator UI persists. No drum instrument/kit/trigger pattern structures.
+- Fix: Drum-specific instrument and voice selection, note-trigger mapping, per-drum synthesis, per-step sequencer where supported, accent/gate controls and patch/kit audition. All names and value ranges sourced from official Drum engine and parameter chart, not guessed.
+P1-13: No real patch or ensemble librarian / chip calibration UI
+- Evidence: SID editor imports Save, Reset, Sparkles icons but has no connected patch SysEx load/save. Only name, local patch values and socketLeftModel/`socketRightModel` exist. Official manual describes ensembles, per-SID MIDI/clock/patch assignments, per-chip filter calibration, BankStick storage and SysEx editors.
+- Fix: Device/firmware identity, four core states, two SID sockets each, 6581/8580/6582 filter calibrations per chip, master/slave ensemble settings, live patch select and read, raw .syx import/export, save-as backup with verification, write protection, restore. Add comparison between file state / device state, dirty/unsynced indicators.
+P1-14: Protocol catalog is dangerously under-specified and may conflate SID register addresses with MIDIbox NRPN addresses
+- Evidence: src/data/protocolCatalog.ts:102-180 has only five SID NRPN claims and one SysEx entry, all labeled provisionally documented; controllerOrAddress is a single numeric field without message framing, param-size, version, engine, destination core and endianness. Existing addresses 0x0100/0x0101/0x0140... must be checked against actual V2 parameter charts before any real output.
+- Fix: Structured protocol registry assembled from the MIDIbox SID V2 Parameter Chart, CC Implementation Chart and SysEx Implementation (official manual). Each entry must include exact address and byte encoding, engine applicability, hardware model, bounds, editability and verified test vectors. Separate hardware SID register semantics from MIDIbox firmware NRPN addressing. Block writes for unknown mappings and log raw TX/RX.
+P1-15: Voice lifetime bugs and misleading simulator
+- Evidence: audioEngine.ts:376-401 starts two SID WebAudio oscillators but stores only osc1 in the active voice map. Note off (404-421) stops only stored oscillator; second oscillator continues running. panicVoice('nes.') cancels other NES notes, including DPCM, when an NES note triggers (295-298); this breaks independent MIDInes voices. Monophonic flag/voice management and event note-on velocity-zero conversion require review.
+- Fix: Store/dispose every created audio node per synthetic voice; panic only the target NES voice, never entire MIDInes on each new note; automated max-active-node leak tests. Clearly label simulator as non-authentic approximation.
+P1-16: Mixer/pre-post sends, solo and hardware feedback protection are not actually enforced
+- Evidence: audioEngine.ts:175-190 sends always connect after fader; updateMixerStrip:253-286 does not use sendAPre, sendBPre or soloed. Patchbay src/components/PatchbayView.tsx:55-74,124 declares interlocks verified through UI without physical routing enforcement.
+- Fix: Route graph must reflect pre/post switches, exclusive/solo modes, mono input stereo panning and four stereo SID pairs; reject overlapping prohibited physical channel assignments and feedback cycles. FX return -> its own send prohibited by default; mastering return must be record/monitor only and never feed master send. Test independently with graph simulation and hardware loopback.
+P1-17: Looping/recording timing and seam testing are not reliable
+- Evidence: MasteringExportView.tsx:85-90 hardcodes four bars to 8 seconds (only true at specific tempo/time signature). :106-129 10-cycle audition just increments a counter every 450ms, doesn't play cycles. src/services/audioExport.ts seam analyzer compares start+length instead of the last included sample and treats out-of-range boundaries as seamless.
+- Fix: Loop times derive from MIDI tempo map + bar grid + measured hardware record alignment. Account for effect tails, latency and the actual OGG decoded sample timeline. Seam audition must replay a real short cross-boundary audio buffer repeatedly. Negative/out-of-range boundaries must fail loudly. Validate LOOPSTART/LOOPLENGTH by decoding exported OGG.
+P1-18: Recording buffers are unbounded and the capture mechanism is deprecated
+- Evidence: src/services/audioEngine.ts:524-574 uses deprecated ScriptProcessorNode plus one Float32Array copy per block retained in memory for full duration; source is synthetic browser master not ASIO input pair.
+- Fix: Native ASIO callback + lock-free ring buffer + streaming writer to temporary WAV file, disk-full/overrun telemetry, crash-safe finalization, capture sample position and calibration. Never do file I/O or UI work in audio callback.
+P1-19: Project save misses actual musical content and can fabricate successful recall
+- Evidence: src/App.tsx:334-382 JSON session includes settings, mixer and patches, but not the imported MIDI bytes or reliable original file reference; handleLoadProject doesn't reload recorded audio or the MIDI source, nor mixer and calibration state. Static session ID chiptune_session_01.
+- Fix: Project bundle with .mid source hash/content, mapping schema version, device identity/firmware and patch SysEx snapshots, routing/calibration, recording provenance, export options, checksum, migration and rollback. Load validation must detect missing MIDI/source, not silently play the unrelated demo.
+P1-20: Tests prove string/header presence, not hardware behavior or decodability
+- Evidence: test/audioExport.test.ts:48-81 only checks container magic and loop tags; test/midiParser.test.ts demo checks; no audio decoder cross-validation, no MIDIbox SID SysEx roundtrip, no MIDI port tests, no ASIO loopback, no routing verification.
+- Fix: Expand CI with SMF fixtures (conductor first, format-0, tempo changes, same-tick CC+notes, malformed files), deterministic virtual MIDI ports, golden NRPN and SysEx bytes, full encode/decode OGG with FFmpeg/ffprobe and RPG Maker MV end-to-end test, audio graph feedback tests and hardware qualification checklist.
+MIDIbox SID V2 — complete editor work breakdown
+Critical premise: Four audio outputs/pairs are physical stereo core groups, not proof that each V2 engine has exactly one playable voice or MIDI channel. The Lead engine can be stereo-unison, while Multi and Drum involve multiple instruments/note mapping inside a core. Maintain fixed four stereo mixer strips but allow per-engine MIDI sub-routing and instrumentation.
+A. Global/device/ensemble editor
+1. MIDI port discovery, device/firmware/profile selection, four master/slave cores present/absent.
+2. Eight socket metadata records: chip type (6581/8580/6582), filter calibration/range, actual left/right board wiring; data provenance and hardware identity.
+3. Per-core patch/bank assignment, MIDI receive channel and alternate engine-specific sub-instrument mappings.
+4. Ensemble MIDI clock master/slave/auto, arpeggiator, LFO/ENV/wavetable sync and trigger matrix parameters.
+5. Core MIDI and SysEx targeting, patch dump requesting, receive, save/restore, verification and recovery.
+6. Backups before any destructive write, firmware compatibility guard and read-only mode.
+B. Lead engine editor
+1. Left and right SID panels; three oscillators each, complete voice waveform bitmasks (including valid combinations), tune/transposition, pulsewidth, gate/test/sync/ring behavior where documented, glide/portamento.
+2. SID filter per chip; cutoff, resonance, mode combinations, per-oscillator filter routing, voice3-off and external-in when supported, calibration display, and VCA ADSR of individual voices.
+3. Six LFO tabs; actual firmware-supported waveforms, rates, depth, sync mode, phase, retrigger and assignments.
+4. Two enhanced envelope generators; full ramp/curve and target parameters, not just ADSR.
+5. Eight-row modulation path matrix: for each path source1/source2, operator, signed depth, independently selected targets for left/right, inversion and modulation-chain dependencies; graphical routing and cycle/saturation diagnostics.
+6. Four wavetable sequencer editors with step-value grids, duration, looping, assignment and clock mode as per firmware.
+7. Trigger matrix and assignable modulation wheel / velocity / aftertouch / five knob controls; assignable min/max/target mappings.
+8. Stereo comparison, L/R copy/swap, per-side randomization and a patch difference viewer.
+C. Bassline engine editor
+1. Two bassline instruments as configured within the core (left/right), with separate voice/filter/envelope/LFO settings.
+2. Step sequencer pattern editor for notes, rests, slide, gate, accent and sound parameter tracks. Pattern selection, lengths, transpose, timing/clock/swing; only implement numeric ranges proven by documentation.
+3. Per-instrument two LFOs and an envelope; static destinations/depths, accent-dependent depth, key tracking, glide.
+4. Pattern storage/import-export and internal sequencer-vs-external MIDI trigger modes.
+D. Multi engine editor
+1. Up to six instruments per core (subject to hardware population/firmware), voice allocator and assignable left/right SID oscillator resources.
+2. Instrument MIDI channel/key and velocity ranges; mono/poly modes, note priority, tuning and controller routes.
+3. Per-instrument oscillator, envelope, two LFOs, one wavetable and static filter routing.
+4. Six possible concurrent wavetables, polyphony/voice steal/ADSR-bug workaround warnings and calibration.
+5. Prevent impossible routing (more simultaneous voices than physical SID oscillators; unavailable chips; inaccessible filter routes).
+E. Drum engine editor
+1. Drum voice/kit browser with MIDI note triggers and hardware sound definitions sourced from the Drum engine manual.
+2. Per-drum oscillator settings, envelope/filter/trigger behavior, accent and sequencer pattern editing supported by the firmware.
+3. Pattern banks, triggering and clock controls and drum audition from actual hardware. Distinguish MIDIbox SID Drum sounds from MIDInes DPCM sounds.
+F. Shared engineering behavior
+- Parameter registry drives rendering + serialization + validation + protocol IO, with engine applicability and exact destination addressing.
+- Separate temporary shadow patch state and persistent BankStick writes; mark dirty, pending and confirmed status.
+- Numeric input and physical units alongside each control; no ambiguous 0-100% knobs for protocol-specific registers.
+- Undo/redo and per-core copy, compare, paste, patch migration, randomization with reproducible seed.
+- Enforce controller TX throttling and NRPN atomic groups; respect MIDI bandwidth and note priority.
+- Error visibility: device absent, SysEx timeout, malformed dump, write protection, incomplete patch, unsupported firmware, discrepancy after readback.
+- All real-time editing and automation must survive stop/restart, project save/load, and patch recall.
+Hardware and protocol evidence references
+- MIDIbox SID V2 complete user manual and parameter charts: https://www.ucapps.de/midibox_sid_manual.html
+- Lead/modulation sources/operators/targets: https://ucapps.de/midibox_sid_manual_l.html
+- Frontpanel modulation matrix: https://www.ucapps.de/midibox_sid_manual_fp.html
+- Bassline engine: https://www.ucapps.de/midibox_sid_manual_b.html
+- Multi engine: https://www.ucapps.de/midibox_sid_manual_m.html
+- Ensembles and master/slave clock: https://www.ucapps.de/midibox_sid_manual_e.html
+- Available complete Ctrlr SysEx editor (use as functional reference, verify firmware compatibility): https://www.ucapps.de/midibox_sid_manual_ed.html
+- MIDIbox SID features and NRPN/SysEx: https://www.ucapps.de/midibox_sid.html
+Gemini implementation contract (mandatory)
+Phase 0 — truthfulness and test harness: Rename UI and engine behavior explicitly as SIMULATION, remove fabricated calibration success and synthetic recordings exported as real masters. Add CI command for test suite and FFmpeg/ffprobe decoder tests. Correct OGG encoder first.
+
+Phase 1 — MIDI contracts: Implement standalone Windows MIDI port layer with independent MIDInes and MIDIbox SID destinations; robust MIDI import and semantic channel mapping. Fix conductor/track indexing and DPCM offset. Dispatch all required events and full panic/reset.
+
+Phase 2 — MIDIbox SID protocol and patch schema: Build exact V2 protocol registry from official tables. Use byte-level test vectors before UI. Discriminated engine patch models, SysEx librarian and reversible serialization. Do not invent register/NRPN addresses. Start read-only protocol inspection if unsure.
+
+Phase 3 — Full SID editor: Lead, Bassline, Multi and Drum separate screens with all documented parameters, stereo/core/instrument targets, modulation/wavetable/trigger/sequencer editors. Maintain explicit unsupported/not verified UI states; no fake interactive controls.
+
+Phase 4 — Native audio: Build Windows ASIO backend, physical device selection, 1x mono NES + 4x SID stereo, external FX A/B sends/returns, stereo mastering chain send, real stereo master return, real calibration and feedback safety. Preserve simulator only as an explicit offline test mode.
+
+Phase 5 — Recording/export: Stream capture from physical return to lossless WAV, convert using proven Vorbis encoder, set sample-exact RPG Maker MV OGG tags, verify decoded loop and actual MV playback. No recording -> no export.
+
+Phase 6 — Reliability: Structured project assets, firmware/device snapshots, failure modes, recovery, unit/integration/hardware tests and regressions.
+Definition of done / objective pass gates
+- [ ] 4 MIDIbox SID cores addressable and connected; all 8 chip sockets profiled.
+- [ ] Every supported parameter in the published V2 chart represented in one or more engine-specific editors, with documented protocol mapping and writable/readable status.
+- [ ] Patch .syx read -> parse -> serialize -> compare roundtrips losslessly on known fixtures.
+- [ ] All 8 main MIDI instrument lanes plus auxiliary DPCM map correctly even when SMF has a separate conductor track.
+- [ ] Ordered CC/NRPN/clock + note messages emitted to proper MIDI device, observable on virtual MIDI capture.
+- [ ] Two external stereo effects loops and mastering return are physically routed on actual ASIO channels, independently loopback-tested and protected from feedback.
+- [ ] Master capture is verified to originate from selected hardware return, not local demo audio.
+- [ ] OGG decodes in ffmpeg/ffprobe and plays in RPG Maker MV; loop tags and 10-cycle seam audition are real.
+- [ ] Tests fail when protocols, routing, encoding or hardware assumptions are invalid; they do not merely check labels, headers and timer animations.
+Review limitations
+This is static analysis of the main branch through GitHub and cross-check against official MIDIbox SID V2 documentation. No npm install, TypeScript compilation, execution, GUI interaction, native ASIO/MIDI device, or physical synthesizer testing occurred. Line numbers are source line numbers at review time and can drift as Gemini edits code. Some missing features are intentional prototype scope; they are nonetheless blockers relative to the user's full hardware workstation requirements. This report does not claim unverified MIDIbox SID NRPN addresses are correct.

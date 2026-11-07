@@ -310,7 +310,9 @@ export class MidiParser {
       channelGroups.forEach((evList, ch) => {
         let minNote = 127;
         let maxNote = 0;
+        let noteCount = 0;
         for (const e of evList) {
+          if (e.type === 'noteOn' && e.velocity && e.velocity > 0) noteCount++;
           if (e.note !== undefined) {
             if (e.note < minNote) minNote = e.note;
             if (e.note > maxNote) maxNote = e.note;
@@ -319,6 +321,8 @@ export class MidiParser {
         tracks.push({
           index: chIdx,
           name: `Channel ${ch + 1}`,
+          isConductor: noteCount === 0,
+          noteCount,
           eventCount: evList.length,
           channelMask: [ch],
           noteRange: { min: minNote === 127 ? 0 : minNote, max: maxNote },
@@ -332,12 +336,16 @@ export class MidiParser {
         const channelSet = new Set<number>();
         let minNote = 127;
         let maxNote = 0;
+        let noteCount = 0;
 
         for (const ev of trk.events) {
           ev.timeSec = tickToSeconds(ev.tick);
           if (ev.tick > maxTick) maxTick = ev.tick;
           if (ev.type === 'noteOn' || ev.type === 'noteOff' || ev.type === 'cc') {
             channelSet.add(ev.channel);
+          }
+          if (ev.type === 'noteOn' && ev.velocity && ev.velocity > 0) {
+            noteCount++;
           }
           if (ev.note !== undefined) {
             if (ev.note < minNote) minNote = ev.note;
@@ -347,7 +355,9 @@ export class MidiParser {
 
         tracks.push({
           index: idx,
-          name: trk.name || `Track ${idx + 1}`,
+          name: trk.name || (noteCount === 0 ? 'Conductor Track' : `Track ${idx + 1}`),
+          isConductor: noteCount === 0,
+          noteCount,
           eventCount: trk.events.length,
           channelMask: Array.from(channelSet),
           noteRange: { min: minNote === 127 ? 0 : minNote, max: maxNote },
