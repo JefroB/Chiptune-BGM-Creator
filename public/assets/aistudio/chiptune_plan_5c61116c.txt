@@ -1,0 +1,678 @@
+CHIPTUNE HARDWARE WORKSTATION
+Complete implementation specification and phased build plan for Gemini
+Revision 1.0 | 2026-11-07 | Target: Windows desktop TypeScript prototype
+
+==========================================================================
+0. MANDATE / HOW GEMINI SHOULD USE THIS DOCUMENT
+==========================================================================
+Build a usable, testable Windows application for importing precomposed MIDI,
+controlling a MIDInes and an eight-chip MIDIbox SID, mixing their physical
+outputs through a multichannel ASIO interface and two external stereo effects
+loops, routing the resulting stereo mix through external mastering hardware,
+recording the stereo return, and exporting RPG Maker MV-compatible OGG BGM.
+
+The deliverable is working source code, a repeatable Windows build, tests,
+setup instructions, device simulators, and clear documentation of every
+unverified hardware protocol detail. This is NOT a request to build a generic
+DAW. Do not implement piano-roll editing, software effects, multitrack audio
+recording, or cross-platform support in version 1. Do not silently substitute
+WASAPI for ASIO. Do not invent MIDInes/MIDIbox SID MIDI CC, NRPN or SysEx
+numbers. Do not claim sample-note mappings are verified when they are inferred.
+
+IMPORTANT: The user specifically requires .OGG export for RPG Maker MV BGM.
+An exported, validated Ogg Vorbis file is a release-blocking acceptance test,
+not an optional future enhancement. Save WAV archival masters as well, but
+OGG is the required game-delivery format.
+
+Ask only genuinely blocking hardware/protocol questions; use configurable
+placeholders, documented assumptions and a simulated backend to continue
+working while awaiting physical device tests. Do not claim a feature is
+complete merely because its UI exists. Include unit, integration and hardware
+acceptance criteria for each phase. Report gaps honestly.
+
+==========================================================================
+1. LOCKED USER REQUIREMENTS
+==========================================================================
+- OS: Windows only.
+- Primary application language: TypeScript.
+- MIDI: import and play existing Standard MIDI Files; NO MIDI note editor.
+- Musical arrangement: eight primary tracks with fixed instrument assignments.
+- MIDInes: four pitched/noise MIDI channels, one mono physical audio output.
+- MIDIbox SID: eight SID chips, grouped as four stereo tracks / four stereo
+  physical outputs. Hardware contains mixed SID chip types.
+- MIDInes DPCM: fifth MIDInes MIDI channel is available; expose as a special
+  auxiliary DPCM lane so all five NES voices are available without losing
+  any of the eight main musical tracks. MIDI output ports are independent.
+- Synth editing: full supported hardware parameter/patch editing; limited
+  automation, not full DAW automation editing.
+- ASIO: user has a large MOTU/AVB studio setup and many physical inputs and
+  outputs; dynamically enumerate actual available ASIO channels, do not assume
+  a fixed channel count or contiguous physical hardware port naming.
+- Mixer: one mono MIDInes strip and four stereo SID strips; configurable
+  input selection, trim, level, pan/balance, mute/solo, metering, independent
+  sends to two EXTERNAL stereo effects loops.
+- Hardware effects: exactly two external stereo send/return loops in v1;
+  selectable ASIO stereo output pairs and stereo input return pairs.
+- Hardware mastering: stereo send to an external mastering chain, return on
+  dedicated selectable ASIO stereo inputs; capture this final return.
+- Recording: final stereo master only; no multitrack stems in v1.
+- Deliverables: Windows desktop prototype, reproducible project/session save,
+  24-bit/32-bit WAV archival capture, OGG Vorbis BGM export for RPG Maker MV.
+- Soundtrack use: RPG Maker MV background music, including seamless loops.
+
+PROPOSED PRIMARY TRACK ROUTING (configurable MIDI port identifiers, fixed
+logical voice assignments):
+  Track 1 -> MIDInes Pulse 1 -> MIDInes MIDI channel 1
+  Track 2 -> MIDInes Pulse 2 -> MIDInes MIDI channel 2
+  Track 3 -> MIDInes Triangle -> MIDInes MIDI channel 3
+  Track 4 -> MIDInes Noise -> MIDInes MIDI channel 4
+  Track 5 -> MIDIbox SID stereo core/pair 1 -> SID MIDI channel TBD
+  Track 6 -> MIDIbox SID stereo core/pair 2 -> SID MIDI channel TBD
+  Track 7 -> MIDIbox SID stereo core/pair 3 -> SID MIDI channel TBD
+  Track 8 -> MIDIbox SID stereo core/pair 4 -> SID MIDI channel TBD
+  Auxiliary lane -> MIDInes DPCM -> MIDInes MIDI channel 5
+
+MIDInes channel numbering is based on currently recovered documentation and
+must be verified on the actual cartridge. MIDIbox SID channel-to-core routing
+must be discovered/verified from the user's firmware/configuration; do NOT
+assume its four cores are automatically channels 1-4. Distinguish MIDI file
+track indices, source MIDI channel numbers, logical voice slots, physical MIDI
+port, and output MIDI channel. They are not interchangeable.
+
+==========================================================================
+2. ARCHITECTURE: TYPESCRIPT UI + REAL-TIME NATIVE ENGINE
+==========================================================================
+RECOMMENDED:
+- Electron desktop shell; React + TypeScript + Vite UI; strict TypeScript.
+- Node main process for project/file/device orchestration and IPC.
+- Secure context-isolated preload bridge with typed, allowlisted IPC; never
+  expose arbitrary Node APIs to renderer. Electron sandbox, CSP, input
+  validation, no remote content, no eval, no untrusted renderer filesystem.
+- Native C++20 audio/MIDI engine via a thin Node-API (N-API) addon OR a
+  separately spawned native engine with versioned local IPC. Prefer the
+  separate engine if process isolation and crash recovery simplify QA.
+- ASIO support via appropriately licensed ASIO SDK and compatible backend;
+  assess Steinberg SDK license/redistribution requirements before shipping.
+  PortAudio with ASIO-enabled custom build may be an option after licensing
+  and driver compatibility review; do not assume stock npm binaries include
+  ASIO. ASIO device ownership may be exclusive; test MOTU driver behavior.
+- Native MIDI I/O with Windows MIDI APIs / RtMidi as appropriate, but ensure
+  accurate timestamp scheduling. JavaScript timers alone are NOT acceptable
+  for sample-stable recording or dependable hardware MIDI event timing.
+- Native audio callback must be allocation-free, lock-free or bounded,
+  non-blocking, with no filesystem I/O, JS calls, logging, or UI rendering.
+- Use SPSC queues/ring buffers for audio/MIDI/control handoff, timestamped
+  commands, preallocated buffers, and deterministic shutdown. Native worker
+  thread handles file writing and conversion. Never call FFmpeg in callback.
+- For prototype, a simulated ASIO/audio engine and virtual MIDI device must
+  run without studio hardware; native ASIO backend is a separate milestone.
+- Use FFmpeg/ffprobe subprocesses for WAV -> Ogg Vorbis and metadata validation;
+  verify redistribution/licensing and package binaries accordingly. Never
+  assume browser MediaRecorder outputs suitable OGG Vorbis or loop metadata.
+- Persist sessions as JSON with schema version and Zod validation. Store
+  absolute device paths only as remappable preferences, not hard requirements.
+- Suggested tooling: pnpm, Vitest, Playwright, ESLint, Prettier, electron-builder
+  (or equivalent), CMake for native code, GitHub Actions Windows CI.
+
+PROCESS / DATA FLOW:
+SMF file -> parser -> normalized song model -> scheduler -> MIDI output ports
+         -> MIDInes + MIDIbox SID hardware
+Hardware audio -> ASIO input capture -> input mixer strips -> dry stereo mix
+                                           + send A + send B
+Send A/B -> assigned stereo ASIO physical outputs -> external processors
+         -> assigned stereo ASIO returns -> effects return strips -> mix bus
+Mix bus -> assigned stereo ASIO master output -> hardware mastering chain
+        -> assigned stereo ASIO master return -> record/monitor meters
+        -> archival WAV -> loop/trim/validation -> OGG Vorbis export
+
+The application does NOT generate SID or NES sound in software. Offline MIDI
+rendering is impossible without the actual instruments, except simulator mode.
+
+==========================================================================
+3. REPOSITORY STRUCTURE / CODE CONTRACTS
+==========================================================================
+/apps/desktop/                 Electron main, preload, React renderer
+/packages/domain/              MIDI, project, routing, patch TypeScript types
+/packages/protocol-midines/    MIDInes validated message encoders/decoders
+/packages/protocol-sid/        SID engine-specific NRPN/SysEx abstractions
+/packages/midi-file/           SMF parser, routing, transport scheduler model
+/packages/audio-control/       Typed native engine facade and simulation
+/packages/recording/           Recording session model, exports, loop metadata
+/packages/test-fixtures/       SMFs, synthetic signals, routing fixtures
+/native/                       C++ engine, ASIO, MIDI scheduler, WAV writer
+/docs/                         protocol evidence, diagrams, calibration, QA
+/assets/mappings/              DPCM mapping JSON + provenance and status
+
+TypeScript interfaces (illustrative, refine in code):
+  type VoiceId = 'nes.pulse1'|'nes.pulse2'|'nes.triangle'|'nes.noise'|
+                 'nes.dpcm'|'sid.core1'|'sid.core2'|'sid.core3'|'sid.core4';
+  type MonoInput = { kind:'mono'; channelId:string };
+  type StereoInput = { kind:'stereo'; leftId:string; rightId:string };
+  type OutputPair = { leftId:string; rightId:string };
+  type RoutingConfig = {
+    nesInput:MonoInput; sidInputs:[StereoInput,StereoInput,StereoInput,StereoInput];
+    effectA:{output:OutputPair; return:StereoInput};
+    effectB:{output:OutputPair; return:StereoInput};
+    masterSend:OutputPair; masterReturn:StereoInput;
+  };
+  type MidiRoute = {voiceId:VoiceId; outputPortId:string; channel1to16:number};
+  type PatchParameter = {id:string; engine:string; displayName:string;
+    min:number; max:number; defaultValue?:number; unit?:string;
+    encoding:'cc'|'nrpn'|'sysex'; verified:boolean; source:string};
+  type Song = {smfType:0|1|2; ppq?:number; smpte?:object;
+    tempoMap:unknown[]; timeSignatureMap:unknown[]; tracks:unknown[]};
+  type Project = {schemaVersion:number; title:string; midiAsset:string;
+    midiRoutes:MidiRoute[]; patches:unknown; mixer:unknown;
+    routing:RoutingConfig; loop:unknown; export:unknown; calibration:unknown};
+
+Provide exact validated schemas, typed IPC requests/responses, domain-level
+errors, native engine ABI version and migration tests. No any/unknown leaking
+through public interfaces without runtime validation. Persist user-friendly
+channel labels separately from stable driver channel identifiers; fallback to
+index only with explicit warning if driver exposes no stable identifiers.
+
+==========================================================================
+4. MIDI IMPORT, NORMALIZATION, AND PLAYBACK
+==========================================================================
+- Support Standard MIDI File .mid/.midi, formats 0 and 1; handle type 2 as
+  unsupported with clear error unless explicitly implemented.
+- Parse header, PPQ and SMPTE divisions, tempo events, time signatures, track
+  names, note on/off (including note-on velocity 0), pitch bend, program
+  changes, channel pressure, poly aftertouch, CC, SysEx, running status,
+  end-of-track, MIDI meta events, and simultaneous events deterministically.
+- Preserve source ticks and absolute tick ordering; build tempo map to
+  translate tick -> wall clock; variable tempo and tempo changes supported.
+- If a MIDI file contains more/fewer than eight primary tracks, show a track
+  assignment preview and deterministic mapping policy. Do not assume SMF
+  tracks always equal MIDI channels. Offer per-source-track merge, ignore,
+  or assignment to one of the eight fixed slots; DPCM can be assigned as an
+  auxiliary lane. Do not destructively edit imported source file.
+- For format 0, split channel events into virtual source tracks for assignment.
+- Imported CC/SysEx can conflict with synth editor state: show and enforce
+  configurable policy (default: pass only known safe, mapped events; quarantine
+  unknown SysEx; log skipped data; explicit opt-in for trusted raw SysEx).
+- Allow configurable source channel -> fixed destination voice mapping but
+  never alter the locked logical voice slots without user confirmation.
+- Each MIDI output port has independent 1-16 channel namespace. Provide
+  port discovery, reconnect, friendly aliases, hotplug warnings and test note.
+- Support play, stop, pause, resume, rewind, seek to marker, loop selection,
+  tempo override (optional), transport position and per-track activity.
+- On stop, seek, disconnect, or panic: send all notes off / all sound off where
+  supported, plus voice-specific reset if documented; guard against stuck
+  notes. Restore program/CC state on seek from snapshots, with warnings about
+  unsupported state restoration and potentially disruptive SysEx.
+- Keep accurate note-on/note-off pairing; maintain active-note ledger and
+  avoid overlap/voice-stealing surprises on monophonic NES voices.
+- Provide a preflight report for out-of-range notes, polyphony conflicts,
+  unsupported CC, duplicate source assignments, overlapping same-pitch notes,
+  unknown SysEx, and bank changes during DPCM playback.
+- Timestamp scheduling with bounded lookahead, monotonic clock and calibrated
+  MIDI/audio alignment. Test dense drum patterns, tempo changes and long songs.
+- Track mute/solo affects outgoing MIDI; active notes must be stopped safely.
+- Implement project-wide 'Panic' button always available in UI.
+
+==========================================================================
+5. MIDINES CONTROL / EDITOR / DPCM
+==========================================================================
+- Five distinct NES voice editors: Pulse 1, Pulse 2, Triangle, Noise, DPCM.
+- Provide labeled controls for ALL parameters documented by the actual
+  MIDInes firmware; include duty, pulse volume/envelopes, sweep controls,
+  fine pitch, noise controls, DPCM bank/rate/loop/address/length and special
+  modulation / Wave Traveler behavior where documented and tested.
+- Protocol catalog is data-driven: every parameter has exact message format,
+  range, scaling, enum meanings, hardware voice applicability, evidence URL,
+  firmware applicability, verification status and known side effects.
+- Do not confuse documented 0-15 hardware volume resolution with MIDI CC
+  0-127 scaling; specify conversion and rounding in protocol table.
+- If hardware cannot send its current state back, UI must say 'locally cached'
+  and initialize the device on connect/patch load; never claim readback.
+- Patch presets saved locally as JSON; initialization sends known-safe control
+  messages in a documented order, with MIDI pacing where needed.
+- Display NES-specific limitations: mono output; individual MIDI voices are
+  not separately mixable in ASIO; note/channel-specific volume may be
+  achievable via hardware CC, but not independent post-hardware audio faders.
+- MIDI channel 5 DPCM lane: explicit bank selector, note 0-127 audition grid,
+  labeled sample browser, search by category, sample preview via provided
+  reference audio (not required for runtime), and single-note test send.
+- Bank select CC14 values 0 (Bank 1) and 64 (Bank 2) are documented working
+  assumptions pending physical verification; ensure CC14 is sent before notes.
+- Import the provided 'midines_dpcm_256_mapping.json' with all 256 sample
+  labels. DO NOT mark note order as hardware verified: note order was inferred
+  from Nullsleep archive's ascending individual track numbers, not confirmed
+  by the archive's explicit MIDI note metadata. Preserve per-entry status.
+- Source ZIP includes 256 individual .ogg recordings plus three demos, two
+  bank-wide recordings and cover art. Individual archive numbers 06-133 map
+  provisionally to Bank 1 notes 0-127; 134-261 map provisionally to Bank 2
+  notes 0-127. This is a hypothesis, not proof.
+- Provide hardware verification wizard: select bank, play note, record input,
+  compare/audition reference recording, confirm or correct name/order, store
+  verification date/device/firmware. Support export of corrected JSON/CSV.
+- If DPCM lane uses a ninth logical track, allow importing nine-track MIDI
+  files, or mapping a source drum track to DPCM auxiliary without changing the
+  eight main instrument slots. Make this explicit in composition spec.
+- Document octave naming differences: note 60 may display C4 or C3 depending
+  on application; numeric MIDI note is authoritative.
+- Unknown MIDInes firmware version: detect manually via user profile and
+  keep risky or version-specific controls disabled until verified.
+
+==========================================================================
+6. MIDIBOX SID CONTROL / FOUR STEREO CORES
+==========================================================================
+- Device profile: MIDIbox SID V2 candidate, eight chips as four stereo pairs,
+  mixed 6581/8580/6582 as applicable; chip type recorded PER PHYSICAL SOCKET,
+  not merely per global device. Do not assume all chips behave identically.
+- Model four stereo logical cores/pairs. Each core has its own patch, engine
+  selection and channel mapping; expose Lead, Bassline, Multi, Drum engines
+  when supported by installed firmware/configuration.
+- Implement documented engine-specific parameter pages: oscillators, waveforms,
+  ADSR, filters, LFOs, modulation matrix, arpeggiator, wavetable/step features,
+  sequencer settings, instrument/voice controls and patch metadata. Actual
+  availability varies by engine and firmware: use capability flags.
+- MIDIbox SID documentation reports extensive NRPN control and SysEx patch
+  transfer; build protocol tables from authoritative ucapps.de docs and
+  firmware source, with exact MSB/LSB/controller ordering, value encoding,
+  ranges, checksums, address mapping, response matching, and rate limiting.
+- Avoid sending unverified bulk SysEx writes. Implement read-only capture and
+  protocol logging first; only enable writes after roundtrip tests on a known
+  disposable patch. Backup user patches before any destructive operation.
+- For every parameter: local state, last sent value, optional confirmed
+  hardware value, firmware applicability and error state. Debounce UI knob
+  movement and coalesce NRPN changes; preserve final value and ordering.
+- Patch library: local named presets, tag/search, import/export of known
+  supported patch dumps, diff, duplicate, backup/restore, four-core snapshots.
+- Chip-specific calibration: distinguish filter characteristics and analog
+  variance; provide safe editor notes and optional per-chip metadata. Do not
+  pretend filter cutoff positions produce identical sound on mixed SID chips.
+- MIDIbox SID's internal engine/polyphony behavior may differ from 'one
+  MIDI channel per stereo pair'; verify actual user configuration and enforce
+  one logical track per pair in this app, even if firmware supports more.
+- MIDI feedback loops and patch-dump flooding must be prevented. Capture
+  device identity/firmware where supported; otherwise manual profile.
+
+==========================================================================
+7. LIMITED PARAMETER AUTOMATION
+==========================================================================
+- Required: import and replay safe documented CC/NRPN events already present
+  in MIDI files; optional simple snapshot changes at transport markers.
+- Support named snapshots per synth/core (intro, verse, battle, boss, etc.),
+  with configurable scheduled recall and explicit pacing of messages.
+- No graphical automation lane editor in v1. No speculative automatic CC
+  mapping; display unsupported events and conflict warnings.
+- If both imported MIDI and live UI alter same parameter, use deterministic
+  last-timestamp-wins policy, show source of last change, and permit disabling
+  automation per parameter. Persist behavior in project.
+- Safe initialization: do not overwrite an active patch unexpectedly at play;
+  explicit 'send project patches' confirmation and optional auto-restore setting.
+
+==========================================================================
+8. ASIO DEVICE / ROUTING ENGINE
+==========================================================================
+- Enumerate installed ASIO drivers, selectable sample rates, buffer sizes,
+  supported input/output channel counts, friendly labels and driver control
+  panel where supported. User may have two MOTU 16A units and AVB converters;
+  treat ASIO exposure as ONE selected driver/device stream unless a verified
+  aggregation mechanism exposes all devices together. Never promise that
+  multiple independent ASIO drivers can be synchronized/aggregated trivially.
+- Build routing matrix by stable logical channel IDs, with separate physical
+  input and output mapping; user can rename physical channels.
+- Required strips: MIDInes mono; SID1-4 stereo; FX return A stereo; FX return
+  B stereo; stereo mix bus; stereo mastering return (record-only by default).
+- Each source strip: input selection, gain/trim, phase invert (optional),
+  mono pan or stereo balance, fader, mute, solo, pre/post sends A and B, peak
+  and RMS meters, overload indicators. Explicit gain units dB and true 0dB.
+- Mono MIDInes must be panned into stereo mix; preserve mono source and
+  avoid accidentally selecting duplicate channels as stereo.
+- Two external FX buses: per-source send gains, pre/post choice, selectable
+  output stereo pairs, return stereo input pairs, return trim/fader/mute,
+  return metering and optional wet-only expectation. Send buses must not
+  accidentally feed themselves or create unintended feedback loops.
+- Provide direct/dry bus and effects return summation with floating-point
+  internal mix, clipping indicator and optional safe output attenuation.
+- Master stereo output pair feeds external mastering hardware; dedicated
+  master return stereo input is the ONLY source of final recorded audio.
+- Do NOT digitally route master return back into master send by default;
+  that would create a feedback loop. Monitoring of the master return should
+  be explicitly configurable and must avoid physical feedback/double-monitor.
+- Detect duplicate/overlapping assignments (e.g. FX send outputs overlapping
+  master outputs, FX returns sharing SID inputs, master return used as FX
+  return). Block unsafe collisions or require clearly labeled expert override
+  where physically meaningful. Never silently remap.
+- All routing changes during playback must be click-safe (gain ramp, crossfade
+  or explicit stop requirement). Audio buffer math must handle non-interleaved
+  ASIO formats, integer/float conversions, channel offsets and endian issues.
+- Include routing presets, save/restore, disconnected-channel state, and
+  'test signal' with volume safety interlock; do not send loud signals to
+  external hardware without explicit consent and level limit.
+- Provide audio health metrics: callback overruns, dropouts, peak, RMS, sample
+  rate, buffer size, roundtrip latency, input silence detection and disk
+  writer backlog. Surface errors immediately and write diagnostic logs.
+
+==========================================================================
+9. CLOCKS, LATENCY, AND CALIBRATION
+==========================================================================
+- Audio ASIO sample clock is reference for recording timeline. MIDI output
+  scheduling is calibrated against captured audio; do not assume USB MIDI
+  dispatch and analog hardware response are instantaneous or deterministic.
+- Record per-device MIDI-to-audio offset; per-FX-loop roundtrip delay; master
+  chain roundtrip; ASIO input/output latency and driver-reported values.
+- Calibration wizard: emit test MIDI events / safe audio impulses; record
+  physical return, estimate delays, show measurements and confidence; manual
+  override if auto-detection is unreliable. Avoid triggering unknown high
+  output levels; require user to patch a known test path.
+- Dry vs external wet latency must be handled: compensate dry path or align
+  FX returns using bounded delay buffers; ensure no phase/comb filtering when
+  external effects are parallel and partly dry.
+- Do not apply naive fixed offsets when hardware effect latency varies with
+  settings; permit per-session recalibration and manual adjustment.
+- When recording a MIDI loop, allow pre-roll, warmup, tail capture and loop
+  boundaries aligned to actual captured audio; calculate based on tempo map,
+  not a fixed BPM assumption. Account for notes/sustains crossing loop edge.
+- Log underruns, late MIDI events, jitter histograms and loop seam metrics.
+
+==========================================================================
+10. RECORDING / WAV MASTER / REQUIRED OGG EXPORT
+==========================================================================
+- Arm record on dedicated mastering stereo return; show peak meters, sample
+  rate, expected bit depth, disk destination and free-space check.
+- Transport: armed -> pre-roll -> playing/recording -> optional post-roll ->
+  finalizing -> complete; allow cancel and recover partial files after crash.
+- Capture full precision float internally; archival WAV as 24-bit PCM or
+  32-bit float (user-selectable); retain source sample rate, timestamp and
+  project/patch/routing manifest. Dither only when reducing to integer PCM.
+- Record only the stereo mastering return; other strips are monitored/mixed
+  but are NOT separately written as stems in v1.
+- File writer on non-real-time thread; ring buffer overflow detection and
+  conspicuous error, never silently drop samples. Use temp files, atomic
+  rename, robust file-close and crash recovery.
+- Export OGG VORBIS, not Opus-in-Ogg. FFmpeg encoder example:
+    ffmpeg -y -i "master.wav" -map 0:a:0 -c:a libvorbis -q:a 6 \
+      -ar 44100 -ac 2 "RPG_BGM.ogg"
+  This is an example, not a fixed quality requirement. Expose OGG quality
+  (e.g. q 4-8), sample rate 44.1/48 kHz, stereo and output name. Avoid
+  unnecessary resampling when source is already supported. Resample with
+  high-quality converter if requested. Run ffprobe and verify codec_name=
+  vorbis, channels=2, sample rate, duration, decodability and output size.
+- RPG Maker MV requires OGG BGM for web/desktop target; for platform targets
+  that also require M4A, optional future export can be added, but .OGG is
+  REQUIRED now. Place game-ready file in project's audio/bgm directory when
+  user selects the RPG Maker MV project; do not overwrite without confirmation.
+- BGM LOOPING: RPG Maker MV uses OGG loop metadata in supported deployment
+  paths. Research and test exact engine behavior/version/plugin interactions
+  before committing to tag names; likely LOOPSTART and LOOPLENGTH as PCM
+  sample counts, but VERIFY in target MV build and playback path. Never
+  confuse seconds, MIDI ticks, samples, encoded packet positions or bytes.
+- Provide loop start/end selection in beats/bars and measured audio samples;
+  allow export of seamless loop with pre-roll and release-tail policy. A tail
+  can be mixed/crossfaded into the loop head if musically appropriate, but
+  never silently alter the recorded master without preview and undo.
+- Vorbis encoder delay/granule position and decoder behavior can affect loop
+  boundaries; test actual MV playback, not merely WAV seam. Implement
+  listening preview across 10+ consecutive loop boundaries and numerical
+  seam discontinuity analysis. Ensure loop length and tags survive encoding.
+- Write optional metadata manifest (.json) alongside exported .ogg:
+  source project, MIDI file checksum, sample rate, BPM/tempo map, loop start
+  and length in samples, encoder version, quality, audio file hash and
+  validation results. Manifest is not required by RPG Maker MV.
+- Export presets: 'RPG Maker MV OGG BGM', 'Archival WAV', 'Both'. Default Both.
+- Filename sanitization, deterministic naming, no invalid Windows chars,
+  avoid collisions, atomic writes, disk-space and permissions handling.
+- Must test OGG in a minimal actual RPG Maker MV project. A valid .ogg alone
+  does not prove loop tags are recognized by the game's playback stack.
+
+==========================================================================
+11. USER INTERFACE / WORKFLOW
+==========================================================================
+Main screens/tabs:
+  A. Project Dashboard: open/save/recent, hardware status, preflight checklist.
+  B. MIDI Import: file preview, tempo/time sig, track/channel routing matrix,
+     warnings, DPCM aux lane, audition, transport.
+  C. Hardware Editors: MIDInes 5 voices; SID 4 cores with engine-specific
+     pages, patch snapshots, bulk transfer backup and safe apply.
+  D. Audio Mixer: five source strips + two FX returns + stereo master send +
+     mastering return record meter; pre/post send knobs and mute/solo.
+  E. ASIO Patchbay: visual input/output channel matrix, presets, feedback
+     warnings, hardware FX/master connection diagram and test tone.
+  F. Recording & Export: arm, record, waveform preview, trim/loop selection,
+     OGG settings, MV export target, validation status and audition.
+  G. Settings/Diagnostics: driver, buffer, MIDI ports, latency calibration,
+     firmware profiles, protocol logs, crash recovery, simulator.
+
+UX requirements:
+- Clear separation between MIDI tracks and physical audio channels.
+- Color/status indicators for disconnected MIDI, missing ASIO, clipping,
+  feedback risk, unsaved patch edits and unverified DPCM sample mappings.
+- Resizable panels; keyboard shortcuts for play/stop/record/panic; accessible
+  controls with typed numeric entry, fine adjustment and undo where safe.
+- Never imply hardware settings have been applied until MIDI send succeeds;
+  where hardware has no ACK, label 'sent / unconfirmed'.
+- Display routing topology with human-readable labels and L/R mapping.
+- Save window layout and device aliases per workstation; song data per project.
+- Provide startup 'No Hardware' simulator walkthrough for Gemini's testing.
+
+==========================================================================
+12. PROJECT FILES / AI COMPOSER HANDOFF
+==========================================================================
+- Project extension e.g. .chipstudio.json or .chipproj with explicit schema.
+- Store MIDI asset path relative to project; optional copy-into-project mode.
+- Save imported MIDI checksum, track assignment, hardware MIDI output ports,
+  synth patches, automation snapshots, mixer gains/sends, ASIO routing,
+  calibration profile, recording settings, loop region and export history.
+- Never embed copyrighted MIDInes reference recordings into distributed
+  application without rights; use user-supplied sample pack only locally.
+- Build an AI composer specification file with precise logical tracks,
+  note ranges, allowed events, controller table and firmware version. Distinguish
+  'allowed verified' from 'provisional' messages.
+- Define MIDI handoff contract: SMF format 1, PPQ 480 or 960, explicit tempo
+  and time signature, 8 named primary tracks, optional ninth DPCM lane,
+  no unsupported SysEx, fixed target routing, deterministic bank CC before
+  DPCM notes, no illegal overlapping monophonic notes, bounded velocities.
+- Add composer linter CLI: inspect AI-generated MIDI and output structured
+  errors/warnings with bar/beat/tick and remediation. Validate tracks,
+  channels, note ranges, bank select, CC whitelist, voice overlap, tempo map,
+  unsupported pitch bends and missing loop markers.
+- Export machine-readable 'instrument_capabilities.json', 'dpcm_samples.json'
+  and 'composer_rules.md' from same validated protocol tables as the app.
+  This avoids contradictory app and AI documentation.
+- Provide optional example eight-track song and separate DPCM test file,
+  generated from original test patterns (no copyrighted melodies).
+
+==========================================================================
+13. PROTOCOL RESEARCH / EVIDENCE AND SAFETY
+==========================================================================
+Source starting points:
+  MIDInes 2004 archived manual:
+  https://web.archive.org/web/20040903232600/http://www.wayfar.net/0xf00000_manual.php
+  MIDInes 2008 archived manual:
+  https://web.archive.org/web/20080513151811/http://www.wayfar.net/0xf00000_manual.php
+  MIDInes manual transcription:
+  https://chipmusic.org/forums/topic/7400/midines-manual/
+  MIDInes 1.1.0 transcription/discussion:
+  https://fr.audiofanzine.com/console-de-jeu/nintendo/wayfar-midines-1-1-0/forums/t.328909,des-utilisateurs.html
+  MIDIbox SID main documentation:
+  https://www.ucapps.de/midibox_sid.html
+  Nullsleep sample collection:
+  https://nullsleep.bandcamp.com/album/extfield-001-dpcm-drums
+
+Treat historical websites and forum posts as evidence, not perfect firmware
+specifications. For each control, record exact URL/document section, protocol
+bytes, firmware scope, validation method, last-tested status. Where a site is
+unavailable, use cached documents only if accessible; do not fabricate quotes.
+Before patch upload or destructive SysEx, backup current hardware patches.
+Raw MIDI/SysEx logs should mask unrelated device identifiers if exporting.
+Implement dry-run MIDI monitor and virtual port first. Guard against MIDI
+feedback, buffer floods, invalid data bytes, endless SysEx and CC storms.
+
+==========================================================================
+14. QA, TEST MATRIX AND ACCEPTANCE CRITERIA
+==========================================================================
+UNIT TESTS:
+- SMF parse format 0/1, tempo changes, running status, note-on zero velocity,
+  simultaneous events, track vs channel distinction, malformed/truncated file.
+- Tick-to-time conversion, loop tick/sample math and sample rate conversions.
+- MIDInes bank switching and 256-map import with correct note indices.
+- SID NRPN/SysEx encoders against documented golden-byte fixtures (only after
+  documentation verification). No speculative fixtures.
+- Mixer gain/pan/mono-to-stereo/send sums, mute/solo, clipping and feedback
+  routing validation, silent input, stereo channel swap detection.
+- WAV header/data lengths, dither, 24-bit conversion, writer recovery.
+- OGG encoder failure handling, ffprobe validation, loop tag unit conversion,
+  atomic export and sanitized filenames.
+- Project migration and missing device remapping.
+
+INTEGRATION TESTS (SIMULATED):
+- Import eight-track fixture + DPCM aux, route all events to expected virtual
+  ports/channels, run to completion without stuck notes.
+- MIDI track mute/solo and panic under dense playback.
+- Synthetic 1kHz test signals on each of five audio sources, verify correct
+  ASIO channel mapping and output isolation in virtual mixer.
+- Send source to FX A and B; simulated returns appear exactly once in master.
+- Verify master return, not internal dry mix, is written to recording.
+- Inject ASIO buffer underrun and disconnect; user receives actionable error.
+- Produce archival WAV and game-ready .ogg; decode and compare duration,
+  channels, loop metadata, peak levels and audible continuity.
+- E2E Electron test with Playwright: load project, map ports, edit a patch,
+  import MIDI, play, route, record, export and reopen session.
+
+HARDWARE ACCEPTANCE (MOTU + NES + SID):
+- Confirm actual driver exposes all intended input/output channels and can
+  operate at chosen sample rate/buffer size with AVB converters clocked.
+- Confirm all four NES main MIDI voices respond on expected port/channels;
+  DPCM bank 1/2 notes 0,1,36,60,127 match reference audio before labeling
+  mapping as verified. Check note-off/voice stop behavior.
+- Confirm all four SID stereo pairs respond independently and appear on
+  correctly mapped stereo ASIO inputs. Verify mixed chip types, firmware,
+  NRPN patch changes and patch restore without corruption.
+- Confirm both external stereo effects loops independently send/return,
+  including simultaneous use from a source and pre/post behavior.
+- Confirm external mastering send/return, no feedback and record-only return.
+- Record 5-minute and 30-minute pieces; monitor glitches, drift, disk I/O,
+  CPU load and MIDI timing. Record results in QA report.
+- Export OGG; put file into a real RPG Maker MV project's audio/bgm directory;
+  play it in game, loop repeatedly, check click-free boundaries and tag
+  interpretation. This is mandatory sign-off.
+
+NONFUNCTIONAL TARGETS (validate, do not promise prematurely):
+- 44.1kHz and 48kHz stereo recording, 24-bit archival PCM and OGG Vorbis.
+- Stable playback/recording at supported MOTU ASIO buffer sizes; measured
+  callback utilization with ample safety margin and zero lost audio frames.
+- UI remains responsive under full MIDI traffic and recording.
+- No crashes or corrupted files when MIDI device/ASIO driver disappears.
+- Session can reopen and reproduce MIDI routing, editor state, and mixer.
+
+==========================================================================
+15. IMPLEMENTATION PHASES AND DEFINITION OF DONE
+==========================================================================
+PHASE 0: Research + hardware inventory + skeleton
+  - Identify MIDInes firmware, MIDIbox SID firmware and four-core channel
+    assignments, physical SID chip positions, MOTU ASIO driver and ports.
+  - Record protocol evidence and unresolved questions.
+  - Bootstrap monorepo, Electron/React UI, native engine boundary, CI.
+  - DONE: clean Windows build, simulation mode, documented risks.
+
+PHASE 1: MIDI import / simulator / fixed tracks
+  - Implement SMF parser, tempo scheduler, eight main slots + DPCM aux,
+    virtual MIDI output, transport, panic, linter, preflight report.
+  - DONE: fixture plays correct events/ports/times in virtual test.
+
+PHASE 2: Hardware MIDI I/O and MIDInes editor
+  - Enumerate ports, send notes, protocol catalog, pulse/triangle/noise/DPCM
+    editor, sample browser and verification wizard.
+  - DONE: hardware smoke test and MIDI byte-level logs; 256 sample catalog
+    imported with PROVISIONAL mapping labels until verified.
+
+PHASE 3: MIDIbox SID editor
+  - Four stereo core profiles, firmware/engine capabilities, safe NRPN,
+    read-only SysEx initially, patch snapshots and tested patch backup.
+  - DONE: each core independently controlled; no destructive untested writes.
+
+PHASE 4: Native ASIO engine and mixer
+  - ASIO driver enumeration, 5 source strips, FX sends/returns, stereo master
+    send, stereo mastering return, meters, safe routing, simulator tests.
+  - DONE: physical channels and external FX pass loopback tests with no
+    feedback and measurable roundtrip latency.
+
+PHASE 5: Recording and OGG BGM export (RELEASE BLOCKER)
+  - Master return recorder, WAV archive, loop editor, Ogg Vorbis conversion,
+    loop tags/metadata validation, game-ready output and RPG Maker MV test.
+  - DONE: real game successfully plays and loops exported OGG BGM.
+
+PHASE 6: Reliability, calibration, packaging
+  - Latency calibration, hotplug/recovery, load tests, installer, docs,
+    diagnostics export, reproducible Windows builds, project migrations.
+  - DONE: full hardware acceptance checklist signed off.
+
+PHASE 7 (OPTIONAL, NOT BLOCKING): AI composer contract and examples
+  - Generate verified capability exports and MIDI composer rules; CLI linter,
+    sample composition fixtures. Can begin in parallel with phases 1-3.
+  - DONE: AI-authored MIDI passes linter and plays correctly on hardware.
+
+For EACH phase Gemini must return:
+  1. Implemented files and architectural decisions.
+  2. Commands to build, test, and run on Windows.
+  3. Automated test results, with real evidence not invented PASS claims.
+  4. Manual hardware tests required and results/UNKNOWN status.
+  5. Outstanding protocol assumptions and risks.
+  6. Small next-phase plan; avoid sweeping unreviewed rewrites.
+
+==========================================================================
+16. UNRESOLVED DETAILS / QUESTIONS FOR THE USER (NOT BLOCKERS TO SKELETON)
+==========================================================================
+1. Exact MIDInes firmware version and whether cartridge supports MIDI channel
+   offset or custom configuration. Verify DPCM fifth channel behavior.
+2. MIDIbox SID V2 firmware version, each core's actual MIDI channel and
+   configured engine, mixed SID chip models/positions and patch dump support.
+3. Which Windows ASIO driver presents the user's MOTU/AVB rig; whether the
+   full set of required channels appears within ONE driver and sample clock.
+4. Physical ASIO input pairs for four SID stereo outputs; mono MIDInes input;
+   two stereo FX sends and returns; master output and mastering return.
+5. Are external FX returns 100% wet or should app compensate mixed dry/wet?
+6. Whether master return is monitored through hardware DSP/CueMix, through
+   app, or through both; avoid double monitoring and feedback.
+7. Target audio sample rate (default 48kHz or 44.1kHz) and desired OGG quality.
+8. How game loops are authored: bar-based markers, custom MIDI marker names,
+   manual start/end selection, tail handling and MV plugin compatibility.
+9. Whether user wants per-core SID patch snapshots restored automatically at
+   project load, or only upon explicit command (default explicit).
+10. Verify note order of Nullsleep archive against MIDInes hardware before
+    publishing the 256 DPCM note map as 'exact'.
+
+==========================================================================
+17. FAILURE MODES / RISKS TO MITIGATE
+==========================================================================
+- MIDIbox SID firmware variants and engine modes differ; full editing is a
+  research/verification task, not a guarantee based on a generic CC chart.
+- MIDInes DPCM bank note order is inferred from archive sequencing, not proven.
+- One NES mono output cannot be split into four isolated ASIO audio channels.
+- Mixed SID chips have analog variation and differing filter behavior.
+- Multiple MOTU/AVB units may not appear as one ASIO device without proper
+  driver/AVB routing; hardware clock synchronization is essential.
+- Hardware send/return FX create roundtrip latency and possible feedback.
+- Hardware mastering may add variable delay and effects tails.
+- JS event loop is not a hard-real-time audio scheduler.
+- ASIO SDK / FFmpeg redistribution licenses must be reviewed before release.
+- OGG container alone does not imply Vorbis codec or recognized MV loop tags.
+- MV game playback/loop behavior may differ by deployment target and plugins.
+- Windows sleep, USB power management, hotplug, sample-rate changes and disk
+  stalls can interrupt recordings. Recover safely, log exact failure state.
+- Imported AI MIDI may contain unsupported controllers, overlapping NES notes,
+  misrouted channels or invalid bank changes; linter must reject or warn.
+
+==========================================================================
+18. FINAL GEMINI EXECUTION INSTRUCTION
+==========================================================================
+Start by inspecting the repo if one is provided. Otherwise create the monorepo
+and implement Phase 0 then Phase 1 with simulation and test fixtures. Produce
+actual working TypeScript/Electron code, not mock screenshots. Keep a detailed
+IMPLEMENTATION_STATUS.md with every feature marked NOT STARTED / SIMULATED /
+HARDWARE TESTED, and a PROTOCOL_EVIDENCE.md with verified message bytes and
+source links. Do not generate or send guessed SID SysEx/NRPN or MIDInes CC
+values to real devices. The user's required deliverable is a Windows app that
+records the stereo mastering return and exports a VALID, LOOP-TESTED OGG VORBIS
+BGM file for RPG Maker MV. Do not defer OGG export or treat it as optional.
+
+Companion input file: midines_dpcm_256_mapping.json (user-supplied, inferred
+sample note ordering; preserve provenance). Use it as data, not as proof of
+hardware correctness. Where more research is required, create evidence-backed
+TODOs and implement safe stubs; never silently invent mappings.
+
+END OF SPECIFICATION
